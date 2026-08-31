@@ -4,6 +4,8 @@ from agents import Usage
 from agents.items import ModelResponse, TResponseStreamEvent
 from agents.models.interface import Model
 from openai.types.responses import (
+    Response,
+    ResponseCompletedEvent,
     ResponseFunctionToolCall,
     ResponseOutputMessage,
     ResponseOutputText,
@@ -48,8 +50,13 @@ def make_tool_call_response(
 class FakeModel(Model):
     """A model that returns a sequence of canned responses."""
 
-    def __init__(self, responses: list[ModelResponse]):
+    def __init__(
+        self,
+        responses: list[ModelResponse],
+        stream_events: list[list[TResponseStreamEvent]] | None = None,
+    ):
         self.responses = list(responses)
+        self.stream_events = stream_events
         self.call_count = 0
 
     async def get_response(
@@ -73,4 +80,28 @@ class FakeModel(Model):
     def stream_response(
         self, *args: Any, **kwargs: Any
     ) -> AsyncIterator[TResponseStreamEvent]:
-        raise NotImplementedError
+        response = self.responses[self.call_count]
+        self.call_count += 1
+
+        async def events() -> AsyncIterator[TResponseStreamEvent]:
+            if self.stream_events is not None:
+                for event in self.stream_events[self.call_count - 1]:
+                    yield event
+
+            yield ResponseCompletedEvent(
+                type="response.completed",
+                sequence_number=1,
+                response=Response.model_construct(
+                    id=response.response_id,
+                    created_at=0.0,
+                    model="fake-model",
+                    object="response",
+                    output=response.output,
+                    parallel_tool_calls=False,
+                    tool_choice="auto",
+                    tools=[],
+                    usage=None,
+                ),
+            )
+
+        return events()

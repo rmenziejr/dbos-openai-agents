@@ -51,3 +51,39 @@ if __name__ == "__main__":
 
 `DBOSRunner.run()` is a drop-in replacement for `Runner.run()` with the same arguments.
 It must be called from within a `@DBOS.workflow()`.
+
+## Local PostgreSQL environment
+
+The repository includes a local PostgreSQL 16 environment for DBOS-backed examples.
+Start it before configuring or launching DBOS:
+
+```bash
+docker compose up -d
+```
+
+With the defaults, use `postgresql://dbos:dbos@localhost:5432/dbos` as the DBOS
+database URL. `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` can be
+overridden in your shell when starting Compose; the provided values are intended
+only for local development. If port 5432 is in use, start with
+`POSTGRES_PORT=5433 docker compose up -d` and set
+`DBOS_DATABASE_URL=postgresql://dbos:dbos@localhost:5433/dbos` before running
+the notebook. Stop the environment with `docker compose down`.
+
+See `notebooks/durable_agents_examples.ipynb` for regular, sandboxed, and
+agent-as-tool examples.
+
+## Streaming
+
+`DBOSRunner.run_streamed()` is a drop-in replacement for `Runner.run_streamed()`. Consume the returned result with `stream_events()` inside the workflow:
+
+```python
+@DBOS.workflow()
+async def stream_agent(user_input: str) -> str:
+    result = DBOSRunner.run_streamed(agent, user_input)
+    async for event in result.stream_events():
+        # Handle the OpenAI Agents SDK stream event.
+        print(event)
+    return str(result.final_output)
+```
+
+Each model response is persisted as a DBOS step before its events are yielded. This keeps replay durable, but events are emitted after their model-response step completes rather than token-by-token as they arrive from the provider.

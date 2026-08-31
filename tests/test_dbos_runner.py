@@ -13,10 +13,11 @@ from agents import (
     tool_output_guardrail,
 )
 from agents.items import ModelResponse
+from agents.stream_events import RawResponsesStreamEvent
 from agents.tool import function_tool
 from agents.tool_guardrails import ToolInputGuardrailData, ToolOutputGuardrailData
 from dbos import DBOS
-from openai.types.responses import ResponseFunctionToolCall
+from openai.types.responses import ResponseFunctionToolCall, ResponseTextDeltaEvent
 from utils import FakeModel, make_message_response, make_tool_call_response
 
 from dbos_openai_agents import DBOSRunner
@@ -42,6 +43,7 @@ async def test_simple_message(dbos_env: None) -> None:
     steps = await DBOS.list_workflow_steps_async(workflows[0].workflow_id)
     assert len(steps) == 1
     assert steps[0]["function_name"] == "_model_call_step"
+
 
 @pytest.mark.asyncio
 async def test_tool_call(dbos_env: None) -> None:
@@ -445,15 +447,6 @@ async def test_replay(dbos_env: None) -> None:
     assert call_count == 1
 
 
-def test_streaming_not_supported() -> None:
-    """DBOSModelWrapper.stream_response raises NotImplementedError."""
-    from dbos_openai_agents.runner import DBOSModelWrapper, _State
-
-    wrapper = DBOSModelWrapper(FakeModel([]), _State())
-    with pytest.raises(NotImplementedError, match="Streaming is not supported"):
-        wrapper.stream_response()
-
-
 @pytest.mark.asyncio
 async def test_string_model_name(dbos_env: None) -> None:
     """When agent.model is a string, DBOSModelProvider resolves and wraps it."""
@@ -480,3 +473,95 @@ async def test_string_model_name(dbos_env: None) -> None:
     steps = await DBOS.list_workflow_steps_async(workflows[0].workflow_id)
     assert len(steps) == 1
     assert steps[0]["function_name"] == "_model_call_step"
+
+
+@pytest.mark.asyncio
+async def test_streamed_message(dbos_env: None) -> None:
+    """DBOSRunner streams a durable model response and returns its final output."""
+    model = FakeModel(
+        [make_message_response("Hello!")],
+        stream_events=[
+            [
+                ResponseTextDeltaEvent(
+                    type="response.output_text.delta",
+                    sequence_number=1,
+                    content_index=0,
+                    delta="Hello",
+                    item_id="msg_1",
+                    logprobs=[],
+                    output_index=0,
+                )
+            ]
+        ],
+    )
+    agent = Agent(name="test", model=model)
+
+    @DBOS.workflow()
+    async def wf(user_input: str) -> tuple[str, list[str]]:
+        result = DBOSRunner.run_streamed(agent, user_input)
+        events = [event async for event in result.stream_events()]
+        raw_events = [
+            str(event.data.type)
+            for event in events
+            if isinstance(event, RawResponsesStreamEvent)
+        ]
+        return str(result.final_output), raw_events
+
+    output, raw_events = await wf("Hi")
+
+    assert output == "Hello!"
+    assert raw_events == ["response.output_text.delta", "response.completed"]
+
+    workflows = await DBOS.list_workflows_async()
+    assert len(workflows) == 1
+    steps = await DBOS.list_workflow_steps_async(workflows[0].workflow_id)
+    assert len(steps) == 1
+    assert steps[0]["function_name"] == "_model_stream_step"
+
+
+@pytest.mark.asyncio
+async def test_streamed_tool_call_replays_durably(dbos_env: None) -> None:
+    """Streamed tool calls replay without recalling the model or tool."""
+    tool_calls: list[str] = []
+
+    @function_tool
+    @DBOS.step()
+    async def get_weather(city: str) -> str:
+        """Return the weather for a city."""
+        tool_calls.append(city)
+        return f"Sunny in {city}"
+
+    model = FakeModel(
+        [
+            make_tool_call_response("call_1", "get_weather", '{"city": "NYC"}'),
+            make_message_response("The weather in NYC is sunny."),
+        ]
+    )
+    agent = Agent(name="test", model=model, tools=[get_weather])
+
+    @DBOS.workflow()
+    async def wf(user_input: str) -> str:
+        result = DBOSRunner.run_streamed(agent, user_input)
+        async for _ in result.stream_events():
+            pass
+        return str(result.final_output)
+
+    output = await wf("What is the weather in NYC?")
+    assert output == "The weather in NYC is sunny."
+    assert tool_calls == ["NYC"]
+    assert model.call_count == 2
+
+    workflows = await DBOS.list_workflows_async()
+    assert len(workflows) == 1
+    workflow_id = workflows[0].workflow_id
+    steps = await DBOS.list_workflow_steps_async(workflow_id)
+    assert len(steps) == 3
+    assert steps[0]["function_name"] == "_model_stream_step"
+    assert "get_weather" in steps[1]["function_name"]
+    assert steps[2]["function_name"] == "_model_stream_step"
+
+    handle = await DBOS.fork_workflow_async(workflow_id, steps[-1]["function_id"] + 1)
+    replay_output = await handle.get_result()
+    assert replay_output == "The weather in NYC is sunny."
+    assert tool_calls == ["NYC"]
+    assert model.call_count == 2

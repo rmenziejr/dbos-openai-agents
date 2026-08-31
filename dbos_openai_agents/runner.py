@@ -13,6 +13,7 @@ from agents import (
 )
 from agents.items import ModelResponse, TResponseOutputItem, TResponseStreamEvent
 from agents.models.multi_provider import MultiProvider
+from agents.result import RunResultStreaming
 from agents.tool import FunctionTool, Tool
 from agents.tool_context import ToolContext
 from dbos import DBOS
@@ -65,6 +66,14 @@ async def _model_call_step(
     return await call_fn()
 
 
+@DBOS.step()
+async def _model_stream_step(
+    call_fn: Callable[[], AsyncIterator[TResponseStreamEvent]],
+) -> list[TResponseStreamEvent]:
+    """Collect a streamed LLM response in a durable DBOS step."""
+    return [event async for event in call_fn()]
+
+
 def _get_function_call_ids(output: List[TResponseOutputItem]) -> List[str]:
     """Extract function call IDs from a model response."""
     return [item.call_id for item in output if item.type == "function_call"]
@@ -105,9 +114,19 @@ class DBOSModelWrapper(Model):
     def stream_response(
         self, *args: Any, **kwargs: Any
     ) -> AsyncIterator[TResponseStreamEvent]:
-        raise NotImplementedError(
-            "Streaming is not supported in durable mode. Use DBOSRunner.run() instead."
-        )
+        def call_llm() -> AsyncIterator[TResponseStreamEvent]:
+            return self.model.stream_response(*args, **kwargs)
+
+        async def stream() -> AsyncIterator[TResponseStreamEvent]:
+            events = await _model_stream_step(call_llm)
+            for event in events:
+                if event.type == "response.completed":
+                    self._state.turnstile = Turnstile(
+                        _get_function_call_ids(event.response.output)
+                    )
+                yield event
+
+        return stream()
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +234,37 @@ class DBOSRunner:
         agent = _wrap_agent(starting_agent, state)
 
         return await Runner.run(
+            starting_agent=agent,
+            input=input,
+            run_config=run_config,
+            **kwargs,
+        )
+
+    @classmethod
+    def run_streamed(
+        cls,
+        starting_agent: Agent[TContext],
+        input: str | list[Any],
+        **kwargs: Any,
+    ) -> RunResultStreaming:
+        """Run an OpenAI agent with durable streamed model responses.
+
+        Must be called from within a ``@DBOS.workflow()`` for durable execution.
+        Model events are persisted after each completed model response, then yielded
+        in their original order.
+        """
+
+        state = _State()
+
+        run_config = kwargs.pop("run_config", RunConfig())
+        run_config = dataclasses.replace(
+            run_config,
+            model_provider=DBOSModelProvider(state),
+        )
+
+        agent = _wrap_agent(starting_agent, state)
+
+        return Runner.run_streamed(
             starting_agent=agent,
             input=input,
             run_config=run_config,
