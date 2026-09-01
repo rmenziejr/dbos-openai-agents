@@ -22,3 +22,8 @@ def test_notebook_contains_all_agent_examples() -> None:
     assert "dbos-capability-events" in source
     assert "sandbox_temporary_dir = tempfile.TemporaryDirectory(" in source
     assert "sandbox_temporary_dir.cleanup()" in source
+    assert (
+        source.index("sandbox_temporary_dir = tempfile.TemporaryDirectory(")
+        < source.index("DBOS.fork_workflow_async")
+        < source.index("sandbox_temporary_dir.cleanup()")
+    )
