@@ -12,3 +12,11 @@ def test_notebook_contains_all_agent_examples() -> None:
     assert "SandboxAgent" in source
     assert "Agent as a tool" in source
     assert "DBOSRunner.run" in source
+    assert "DBOSCapability(Shell())" in source
+    assert "await DBOSRunner.run(" in source
+    assert "DBOS.fork_workflow_async" in source
+    assert "dbos.workflow_status" in source
+    assert "dbos.operation_outputs" in source
+    assert "dbos.streams" in source
+    assert "_native_action_step" in source
+    assert "dbos-capability-events" in source

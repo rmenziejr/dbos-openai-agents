@@ -61,16 +61,58 @@ Start it before configuring or launching DBOS:
 docker compose up -d
 ```
 
-With the defaults, use `postgresql://dbos:dbos@localhost:5432/dbos` as the DBOS
+With the defaults, use `postgresql://dbos:dbos@localhost:7432/dbos` as the DBOS
 database URL. `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` can be
 overridden in your shell when starting Compose; the provided values are intended
-only for local development. If port 5432 is in use, start with
-`POSTGRES_PORT=5433 docker compose up -d` and set
-`DBOS_DATABASE_URL=postgresql://dbos:dbos@localhost:5433/dbos` before running
-the notebook. Stop the environment with `docker compose down`.
+only for local development. If port 7432 is in use, choose an available host port
+when starting Compose and set `DBOS_DATABASE_URL` to the matching PostgreSQL URL
+before running the notebook. Stop the environment with `docker compose down`.
 
 See `notebooks/durable_agents_examples.ipynb` for regular, sandboxed, and
 agent-as-tool examples.
+
+
+## Durable sandbox shell tools
+
+Wrap a capability that performs native actions with `DBOSCapability` and run the
+`SandboxAgent` through `DBOSRunner` from a DBOS workflow:
+
+```python
+from agents import RunConfig
+from agents.sandbox import SandboxAgent, SandboxRunConfig
+from agents.sandbox.capabilities import Shell
+from agents.sandbox.sandboxes import UnixLocalSandboxClient
+from dbos import DBOS
+from dbos_openai_agents import DBOSCapability, DBOSRunner
+
+sandbox_agent = SandboxAgent(
+    name="shell_agent",
+    capabilities=[DBOSCapability(Shell())],
+)
+
+@DBOS.workflow()
+async def run_sandbox_agent(user_input: str) -> str:
+    result = await DBOSRunner.run(
+        sandbox_agent,
+        user_input,
+        run_config=RunConfig(
+            sandbox=SandboxRunConfig(client=UnixLocalSandboxClient()),
+        ),
+    )
+    return str(result.final_output)
+```
+
+The wrapper persists each native action as `_native_action_step`, then writes a
+payload-free `dbos-capability-events` record. Forking a completed workflow after its
+last function ID reuses the saved operation output, so the shell command is not run
+again.
+
+`UnixLocalSandboxClient` is intended for local Unix development, not an isolation or
+deployment boundary for untrusted work. The audit stream contains action metadata
+only (source, owner, action, call ID, and status); command arguments and results are
+not written there. Operation outputs can contain tool results, so PostgreSQL audit
+queries belong behind a trusted database-access boundary with appropriate retention
+and access controls.
 
 ## Streaming
 
