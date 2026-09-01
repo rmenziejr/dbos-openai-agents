@@ -14,9 +14,13 @@ from agents import (
 from agents.items import ModelResponse, TResponseOutputItem, TResponseStreamEvent
 from agents.models.multi_provider import MultiProvider
 from agents.result import RunResultStreaming
-from agents.tool import FunctionTool, Tool
+from agents.sandbox import SandboxAgent
+from agents.sandbox.capabilities import Capability
+from agents.tool import CustomTool, FunctionTool, Tool
 from agents.tool_context import ToolContext
 from dbos import DBOS
+
+from .capabilities import DBOSCapability
 
 # ---------------------------------------------------------------------------
 # Turnstile: ordered execution of concurrent async operations
@@ -47,10 +51,11 @@ class Turnstile:
 
 
 class _State:
-    __slots__ = ("turnstile",)
+    __slots__ = ("turnstile", "durable_custom_tools")
 
     def __init__(self) -> None:
         self.turnstile = Turnstile([])
+        self.durable_custom_tools: dict[int, CustomTool] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -74,9 +79,39 @@ async def _model_stream_step(
     return [event async for event in call_fn()]
 
 
-def _get_function_call_ids(output: List[TResponseOutputItem]) -> List[str]:
-    """Extract function call IDs from a model response."""
-    return [item.call_id for item in output if item.type == "function_call"]
+def _get_function_call_ids(
+    output: List[TResponseOutputItem],
+    tools: list[Tool],
+    durable_custom_tools: dict[int, CustomTool],
+) -> List[str]:
+    """Extract tool call IDs whose invocation wrappers release the turnstile."""
+    durable_custom_tool_names = {
+        tool.name
+        for tool in tools
+        if isinstance(tool, CustomTool) and durable_custom_tools.get(id(tool)) is tool
+    }
+    call_ids: List[str] = []
+    for item in output:
+        if item.type == "function_call":
+            call_id = getattr(item, "call_id", None)
+        elif (
+            item.type == "custom_tool_call"
+            and getattr(item, "name", None) in durable_custom_tool_names
+        ):
+            call_id = getattr(item, "call_id", None)
+        else:
+            continue
+        if isinstance(call_id, str):
+            call_ids.append(call_id)
+    return call_ids
+
+
+def _get_model_tools(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[Tool]:
+    """Return the exact tools supplied for this model request."""
+    candidate = kwargs.get("tools")
+    if candidate is None and len(args) > 3:
+        candidate = args[3]
+    return candidate if isinstance(candidate, list) else []
 
 
 class DBOSModelProvider(MultiProvider):
@@ -106,7 +141,12 @@ class DBOSModelWrapper(Model):
         result: ModelResponse = await _model_call_step(call_llm)
 
         # Prepare the turnstile for any tool calls in the response
-        ids = _get_function_call_ids(result.output)
+        model_tools = _get_model_tools(args, kwargs)
+        ids = _get_function_call_ids(
+            result.output,
+            model_tools,
+            self._state.durable_custom_tools,
+        )
         self._state.turnstile = Turnstile(ids)
 
         return result
@@ -117,12 +157,18 @@ class DBOSModelWrapper(Model):
         def call_llm() -> AsyncIterator[TResponseStreamEvent]:
             return self.model.stream_response(*args, **kwargs)
 
+        model_tools = _get_model_tools(args, kwargs)
+
         async def stream() -> AsyncIterator[TResponseStreamEvent]:
             events = await _model_stream_step(call_llm)
             for event in events:
                 if event.type == "response.completed":
                     self._state.turnstile = Turnstile(
-                        _get_function_call_ids(event.response.output)
+                        _get_function_call_ids(
+                            event.response.output,
+                            model_tools,
+                            self._state.durable_custom_tools,
+                        )
                     )
                 yield event
 
@@ -156,6 +202,17 @@ def _wrap_agent(agent: Agent[TContext], state: _State) -> Agent[TContext]:
     """Return a clone of *agent* with model and tools wrapped for DBOS durability."""
 
     clone_kwargs: dict[str, Any] = {}
+
+    if isinstance(agent, SandboxAgent):
+        capabilities: list[Capability] = []
+        for capability in agent.capabilities:
+            if isinstance(capability, DBOSCapability):
+                durable_capability = capability.clone()
+                durable_capability.bind_durability_state(state)
+                capabilities.append(durable_capability)
+            else:
+                capabilities.append(capability)
+        clone_kwargs["capabilities"] = capabilities
 
     # Wrap the model if it's a Model instance (the SDK uses it directly,
     # bypassing the model_provider).
