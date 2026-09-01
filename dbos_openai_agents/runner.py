@@ -12,11 +12,15 @@ from agents import (
     TContext,
 )
 from agents.items import ModelResponse, TResponseOutputItem, TResponseStreamEvent
+from agents.sandbox import SandboxAgent
+from agents.sandbox.capabilities import Capability
 from agents.models.multi_provider import MultiProvider
 from agents.result import RunResultStreaming
 from agents.tool import FunctionTool, Tool
 from agents.tool_context import ToolContext
 from dbos import DBOS
+
+from .capabilities import DBOSCapability
 
 # ---------------------------------------------------------------------------
 # Turnstile: ordered execution of concurrent async operations
@@ -75,8 +79,15 @@ async def _model_stream_step(
 
 
 def _get_function_call_ids(output: List[TResponseOutputItem]) -> List[str]:
-    """Extract function call IDs from a model response."""
-    return [item.call_id for item in output if item.type == "function_call"]
+    """Extract local tool call IDs from a model response."""
+    call_ids: List[str] = []
+    for item in output:
+        if item.type not in {"function_call", "custom_tool_call"}:
+            continue
+        call_id = getattr(item, "call_id", None)
+        if isinstance(call_id, str):
+            call_ids.append(call_id)
+    return call_ids
 
 
 class DBOSModelProvider(MultiProvider):
@@ -156,6 +167,17 @@ def _wrap_agent(agent: Agent[TContext], state: _State) -> Agent[TContext]:
     """Return a clone of *agent* with model and tools wrapped for DBOS durability."""
 
     clone_kwargs: dict[str, Any] = {}
+
+    if isinstance(agent, SandboxAgent):
+        capabilities: list[Capability] = []
+        for capability in agent.capabilities:
+            if isinstance(capability, DBOSCapability):
+                durable_capability = capability.clone()
+                durable_capability.bind_durability_state(state)
+                capabilities.append(durable_capability)
+            else:
+                capabilities.append(capability)
+        clone_kwargs["capabilities"] = capabilities
 
     # Wrap the model if it's a Model instance (the SDK uses it directly,
     # bypassing the model_provider).

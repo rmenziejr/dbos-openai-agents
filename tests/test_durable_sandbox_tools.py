@@ -1,9 +1,26 @@
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from agents import RunConfig, Usage
+from agents.run_config import SandboxRunConfig
+from agents.items import ModelResponse
+from agents.sandbox import Manifest, SandboxAgent
+from agents.sandbox.capabilities import (
+    Filesystem,
+    FilesystemToolSet,
+    Shell,
+    ShellToolSet,
+)
+from agents.sandbox.entries import LocalDir
+from agents.sandbox.sandboxes.unix_local import UnixLocalSandboxClient
 from dbos import DBOS
+from openai.types.responses import ResponseCustomToolCall
 
+from dbos_openai_agents import DBOSCapability, DBOSRunner
 from dbos_openai_agents.durability import run_durable_action
+from utils import FakeModel, make_message_response, make_tool_call_response
 
 
 class _Turnstile:
@@ -154,3 +171,126 @@ def test_sync_durable_action_replays_without_reinvoking(dbos_env: None) -> None:
     replay = DBOS.fork_workflow(workflow_id, steps[-1]["function_id"] + 1)
     assert replay.get_result() == "native result"
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_dbos_capability_makes_real_shell_invocation_durable(
+    dbos_env: None,
+) -> None:
+    native_invocations = 0
+    with tempfile.TemporaryDirectory(
+        prefix=".shell-data-", dir=Path("tests")
+    ) as directory:
+        data_dir = Path(directory)
+        (data_dir / "brief.txt").write_text("durable shell test")
+
+        def configure_tools(toolset: ShellToolSet) -> None:
+            nonlocal native_invocations
+            original = toolset.exec_command.on_invoke_tool
+
+            async def counted(context: object, raw_input: str) -> object:
+                nonlocal native_invocations
+                native_invocations += 1
+                return await original(context, raw_input)  # type: ignore[arg-type]
+
+            toolset.exec_command.on_invoke_tool = counted
+
+        agent = SandboxAgent(
+            name="shell",
+            model=FakeModel(
+                [
+                    make_tool_call_response(
+                        "call-1",
+                        "exec_command",
+                        '{"cmd":"cat /workspace/data/brief.txt"}',
+                    ),
+                    make_message_response("done"),
+                ]
+            ),
+            default_manifest=Manifest(entries={"data": LocalDir(src=data_dir)}),
+            capabilities=[DBOSCapability(Shell(configure_tools=configure_tools))],
+        )
+
+        @DBOS.workflow()
+        async def workflow() -> str:
+            result = await DBOSRunner.run(
+                agent,
+                "read the brief",
+                run_config=RunConfig(
+                    sandbox=SandboxRunConfig(client=UnixLocalSandboxClient())
+                ),
+            )
+            return str(result.final_output)
+
+        assert await workflow() == "done"
+        workflow_id = (await DBOS.list_workflows_async())[0].workflow_id
+        steps = await DBOS.list_workflow_steps_async(workflow_id)
+        assert any(step["function_name"] == "_native_action_step" for step in steps)
+        events = await _stream_events(workflow_id, "dbos-capability-events")
+        assert {
+            "source": "sandbox_capability",
+            "owner": "shell",
+            "action": "exec_command",
+            "call_id": "call-1",
+            "status": "completed",
+        } in events
+
+        replay = await DBOS.fork_workflow_async(
+            workflow_id, steps[-1]["function_id"] + 1
+        )
+        assert await replay.get_result() == "done"
+        assert native_invocations == 1
+
+
+@pytest.mark.asyncio
+async def test_dbos_capability_retains_filesystem_apply_patch_callback(
+    dbos_env: None,
+) -> None:
+    native_invocations = 0
+
+    def configure_tools(toolset: FilesystemToolSet) -> None:
+        nonlocal native_invocations
+        original = toolset.apply_patch.on_invoke_tool
+
+        async def counted(context: object, raw_input: str) -> object:
+            nonlocal native_invocations
+            native_invocations += 1
+            return await original(context, raw_input)  # type: ignore[arg-type]
+
+        toolset.apply_patch.on_invoke_tool = counted
+
+    agent = SandboxAgent(
+        name="filesystem",
+        model=FakeModel(
+            [
+                ModelResponse(
+                    output=[
+                        ResponseCustomToolCall(
+                            type="custom_tool_call",
+                            call_id="call-2",
+                            name="apply_patch",
+                            input="*** Begin Patch\n*** Add File: durable.txt\n+durable\n*** End Patch\n",
+                        )
+                    ],
+                    usage=Usage(),
+                    response_id="resp-1",
+                ),
+                make_message_response("done"),
+            ]
+        ),
+        capabilities=[DBOSCapability(Filesystem(configure_tools=configure_tools))],
+    )
+
+    @DBOS.workflow()
+    async def workflow() -> str:
+        result = await DBOSRunner.run(
+            agent,
+            "make the file",
+            run_config=RunConfig(
+                sandbox=SandboxRunConfig(client=UnixLocalSandboxClient())
+            ),
+        )
+        return str(result.final_output)
+
+    assert await workflow() == "done"
+    assert native_invocations == 1
