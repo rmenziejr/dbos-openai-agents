@@ -3,9 +3,6 @@
 from typing import Awaitable, Callable, Protocol, TypedDict, TypeVar
 
 from dbos import DBOS
-from dbos._context import snapshot_step_context
-from dbos._core import write_stream as write_stream_in_step
-from dbos._dbos import _get_dbos_instance
 
 DEFAULT_AUDIT_STREAM_KEY = "dbos-capability-events"
 
@@ -43,7 +40,19 @@ class _SyncActionState(Protocol):
 
 
 def _write_stream_sync(key: str, value: AuditEvent) -> None:
-    """Persist a sync-step audit event even when its workflow is async."""
+    """Persist a sync-step audit event even when its workflow is async.
+
+    DBOS's public sync writer rejects an inherited async workflow context, so
+    this narrow bridge is loaded only when a synchronous computer action runs.
+    """
+    try:
+        from dbos._context import snapshot_step_context
+        from dbos._core import write_stream as write_stream_in_step
+        from dbos._dbos import _get_dbos_instance
+    except ImportError as exc:
+        raise RuntimeError(
+            "Synchronous computer-action auditing requires a compatible dbos>=2.10.0"
+        ) from exc
     write_stream_in_step(
         _get_dbos_instance(), snapshot_step_context(reserve_sleep_id=False), key, value
     )

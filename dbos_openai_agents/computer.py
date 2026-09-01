@@ -206,8 +206,12 @@ def DBOSComputerTool(
     tool: ComputerTool[ComputerT], *, audit_stream_key: str = DEFAULT_AUDIT_STREAM_KEY
 ) -> ComputerTool[ComputerT]:
     """Return a ComputerTool whose local actions are replay-safe DBOS steps."""
-    return ComputerTool(
-        computer=cast(Any, wrap_computer_initializer(tool.computer, audit_stream_key)),
-        on_safety_check=tool.on_safety_check,
-        custom_data_extractor=tool.custom_data_extractor,
-    )
+    tool_kwargs: dict[str, Any] = {
+        "computer": wrap_computer_initializer(tool.computer, audit_stream_key),
+        "on_safety_check": tool.on_safety_check,
+    }
+    if "custom_data_extractor" in inspect.signature(ComputerTool).parameters:
+        tool_kwargs["custom_data_extractor"] = getattr(
+            tool, "custom_data_extractor", None
+        )
+    return cast("ComputerTool[ComputerT]", ComputerTool(**tool_kwargs))

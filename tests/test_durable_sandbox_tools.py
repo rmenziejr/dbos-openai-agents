@@ -1,10 +1,12 @@
+import asyncio
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from agents import (
+    Agent,
     AsyncComputer,
     Computer,
     ComputerProvider,
@@ -15,8 +17,8 @@ from agents import (
     dispose_resolved_computers,
     resolve_computer,
 )
-from agents.run_config import SandboxRunConfig
 from agents.items import ModelResponse
+from agents.run_config import SandboxRunConfig
 from agents.sandbox import Manifest, SandboxAgent
 from agents.sandbox.capabilities import (
     Filesystem,
@@ -26,12 +28,13 @@ from agents.sandbox.capabilities import (
 )
 from agents.sandbox.entries import LocalDir
 from agents.sandbox.sandboxes.unix_local import UnixLocalSandboxClient
+from agents.tool import CustomTool, function_tool
 from dbos import DBOS
-from openai.types.responses import ResponseCustomToolCall
+from openai.types.responses import ResponseCustomToolCall, ResponseFunctionToolCall
+from utils import FakeModel, make_message_response, make_tool_call_response
 
 from dbos_openai_agents import DBOSCapability, DBOSComputerTool, DBOSRunner
 from dbos_openai_agents.durability import run_durable_action
-from utils import FakeModel, make_message_response, make_tool_call_response
 
 
 class _Turnstile:
@@ -307,6 +310,81 @@ async def test_dbos_capability_retains_filesystem_apply_patch_callback(
     assert native_invocations == 1
 
 
+@pytest.mark.asyncio
+async def test_durable_custom_tool_membership_is_scoped_across_handoff(
+    dbos_env: None,
+) -> None:
+    """A durable tool name on one agent must not gate another agent's tool."""
+    calls: list[str] = []
+
+    async def ordinary_custom(_: object, raw_input: str) -> str:
+        calls.append(f"custom:{raw_input}")
+        return "custom result"
+
+    @function_tool
+    async def ordinary_function() -> str:
+        """Return an ordinary local function result."""
+        calls.append("function")
+        return "function result"
+
+    worker = Agent(
+        name="worker",
+        model=FakeModel(
+            [
+                ModelResponse(
+                    output=[
+                        ResponseCustomToolCall(
+                            type="custom_tool_call",
+                            call_id="custom",
+                            name="apply_patch",
+                            input="payload",
+                        ),
+                        ResponseFunctionToolCall(
+                            type="function_call",
+                            call_id="function",
+                            name="ordinary_function",
+                            arguments="{}",
+                        ),
+                    ],
+                    usage=Usage(),
+                    response_id="worker-response",
+                ),
+                make_message_response("done"),
+            ]
+        ),
+        tools=[
+            CustomTool(
+                name="apply_patch",
+                description="An ordinary custom tool with a colliding name.",
+                on_invoke_tool=ordinary_custom,
+            ),
+            ordinary_function,
+        ],
+    )
+    router = SandboxAgent(
+        name="router",
+        model=FakeModel(
+            [make_tool_call_response("handoff", "transfer_to_worker", "{}")]
+        ),
+        handoffs=[worker],
+        capabilities=[DBOSCapability(Filesystem())],
+    )
+
+    @DBOS.workflow()
+    async def workflow() -> str:
+        result = await DBOSRunner.run(
+            router,
+            "handoff then run both tools",
+            run_config=RunConfig(
+                sandbox=SandboxRunConfig(client=UnixLocalSandboxClient())
+            ),
+        )
+        return str(result.final_output)
+
+    assert await asyncio.wait_for(workflow(), timeout=3) == "done"
+    assert calls == ["custom:payload", "function"]
+
+
 class RecordingComputer(Computer):
     def __init__(self) -> None:
         self.calls: list[tuple[object, ...]] = []
@@ -373,6 +451,38 @@ class AsyncRecordingComputer(AsyncComputer):
         self.calls.append(("drag", path))
 
 
+def test_dbos_computer_tool_supports_legacy_constructor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The declared 0.14 SDK floor has no custom_data_extractor parameter."""
+
+    class LegacyComputerTool:
+        def __init__(self, computer: object, on_safety_check: object = None) -> None:
+            self.computer = computer
+            self.on_safety_check = on_safety_check
+
+    import dbos_openai_agents.computer as computer_module
+
+    monkeypatch.setattr(computer_module, "ComputerTool", LegacyComputerTool)
+    legacy_tool = SimpleNamespace(
+        computer=RecordingComputer(), on_safety_check=object()
+    )
+
+    wrapped = computer_module.DBOSComputerTool(cast(Any, legacy_tool))
+
+    assert isinstance(wrapped, LegacyComputerTool)
+    assert wrapped.on_safety_check is legacy_tool.on_safety_check
+
+
+def test_dbos_computer_tool_preserves_supported_custom_data_extractor() -> None:
+    extractor = cast(Any, lambda _: {"audit": "metadata"})
+    tool = ComputerTool(computer=RecordingComputer(), custom_data_extractor=extractor)
+
+    wrapped = DBOSComputerTool(tool)
+
+    assert wrapped.custom_data_extractor is extractor
+
+
 @pytest.mark.asyncio
 async def test_dbos_computer_tool_replays_click_and_screenshot_once(
     dbos_env: None,
@@ -412,6 +522,7 @@ async def test_dbos_computer_tool_replays_click_and_screenshot_once(
     steps = await DBOS.list_workflow_steps_async(workflow_id)
     replay = await DBOS.fork_workflow_async(workflow_id, steps[-1]["function_id"] + 1)
     assert await replay.get_result() == "image-2"
+    assert await _stream_events(replay.get_workflow_id(), "computer-audit") == events
     assert computer.calls == [("click", 10, 20, "left"), ("screenshot",)]
 
 
@@ -438,6 +549,7 @@ async def test_dbos_computer_tool_replays_async_type_and_screenshot_once(
     steps = await DBOS.list_workflow_steps_async(workflow_id)
     replay = await DBOS.fork_workflow_async(workflow_id, steps[-1]["function_id"] + 1)
     assert await replay.get_result() == "image-2"
+    assert await _stream_events(replay.get_workflow_id(), "audit") == events
     assert computer.calls == [("type", "private typed text"), ("screenshot",)]
 
 
