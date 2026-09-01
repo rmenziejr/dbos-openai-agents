@@ -211,3 +211,6 @@ __marimo__/
 # Agents
 .agents
 .claude
+
+# Local Git worktrees
+.worktrees/
