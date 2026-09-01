@@ -1,9 +1,20 @@
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
-from agents import RunConfig, Usage
+from agents import (
+    AsyncComputer,
+    Computer,
+    ComputerProvider,
+    ComputerTool,
+    RunConfig,
+    RunContextWrapper,
+    Usage,
+    dispose_resolved_computers,
+    resolve_computer,
+)
 from agents.run_config import SandboxRunConfig
 from agents.items import ModelResponse
 from agents.sandbox import Manifest, SandboxAgent
@@ -18,7 +29,7 @@ from agents.sandbox.sandboxes.unix_local import UnixLocalSandboxClient
 from dbos import DBOS
 from openai.types.responses import ResponseCustomToolCall
 
-from dbos_openai_agents import DBOSCapability, DBOSRunner
+from dbos_openai_agents import DBOSCapability, DBOSComputerTool, DBOSRunner
 from dbos_openai_agents.durability import run_durable_action
 from utils import FakeModel, make_message_response, make_tool_call_response
 
@@ -294,3 +305,180 @@ async def test_dbos_capability_retains_filesystem_apply_patch_callback(
 
     assert await workflow() == "done"
     assert native_invocations == 1
+
+
+class RecordingComputer(Computer):
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+
+    def screenshot(self) -> str:
+        self.calls.append(("screenshot",))
+        return f"image-{len(self.calls)}"
+
+    def click(self, x: int, y: int, button: str) -> None:
+        self.calls.append(("click", x, y, button))
+
+    def double_click(self, x: int, y: int) -> None:
+        self.calls.append(("double_click", x, y))
+
+    def scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
+        self.calls.append(("scroll", x, y, scroll_x, scroll_y))
+
+    def type(self, text: str) -> None:
+        self.calls.append(("type", text))
+
+    def wait(self) -> None:
+        self.calls.append(("wait",))
+
+    def move(self, x: int, y: int) -> None:
+        self.calls.append(("move", x, y))
+
+    def keypress(self, keys: list[str]) -> None:
+        self.calls.append(("keypress", keys))
+
+    def drag(self, path: list[tuple[int, int]]) -> None:
+        self.calls.append(("drag", path))
+
+
+class AsyncRecordingComputer(AsyncComputer):
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+
+    async def screenshot(self) -> str:
+        self.calls.append(("screenshot",))
+        return f"image-{len(self.calls)}"
+
+    async def click(self, x: int, y: int, button: str) -> None:
+        self.calls.append(("click", x, y, button))
+
+    async def double_click(self, x: int, y: int) -> None:
+        self.calls.append(("double_click", x, y))
+
+    async def scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
+        self.calls.append(("scroll", x, y, scroll_x, scroll_y))
+
+    async def type(self, text: str) -> None:
+        self.calls.append(("type", text))
+
+    async def wait(self) -> None:
+        self.calls.append(("wait",))
+
+    async def move(self, x: int, y: int) -> None:
+        self.calls.append(("move", x, y))
+
+    async def keypress(self, keys: list[str]) -> None:
+        self.calls.append(("keypress", keys))
+
+    async def drag(self, path: list[tuple[int, int]]) -> None:
+        self.calls.append(("drag", path))
+
+
+@pytest.mark.asyncio
+async def test_dbos_computer_tool_replays_click_and_screenshot_once(
+    dbos_env: None,
+) -> None:
+    computer = RecordingComputer()
+    tool = DBOSComputerTool(
+        ComputerTool(computer=computer), audit_stream_key="computer-audit"
+    )
+    computer_proxy = cast(RecordingComputer, tool.computer)
+
+    @DBOS.workflow()
+    async def workflow() -> str:
+        computer_proxy.click(10, 20, "left")
+        return computer_proxy.screenshot()
+
+    assert await workflow() == "image-2"
+    workflow_id = (await DBOS.list_workflows_async())[0].workflow_id
+    events = await _stream_events(workflow_id, "computer-audit")
+    assert events == [
+        {
+            "source": "computer_use",
+            "owner": "computer",
+            "action": "click",
+            "call_id": None,
+            "status": "completed",
+        },
+        {
+            "source": "computer_use",
+            "owner": "computer",
+            "action": "screenshot",
+            "call_id": None,
+            "status": "completed",
+        },
+    ]
+    assert "left" not in str(events)
+    assert "image-2" not in str(events)
+    steps = await DBOS.list_workflow_steps_async(workflow_id)
+    replay = await DBOS.fork_workflow_async(workflow_id, steps[-1]["function_id"] + 1)
+    assert await replay.get_result() == "image-2"
+    assert computer.calls == [("click", 10, 20, "left"), ("screenshot",)]
+
+
+@pytest.mark.asyncio
+async def test_dbos_computer_tool_replays_async_type_and_screenshot_once(
+    dbos_env: None,
+) -> None:
+    computer = AsyncRecordingComputer()
+    tool = DBOSComputerTool(ComputerTool(computer=computer), audit_stream_key="audit")
+    computer_proxy = cast(AsyncRecordingComputer, tool.computer)
+
+    @DBOS.workflow()
+    async def workflow() -> str:
+        await computer_proxy.type("private typed text")
+        return await computer_proxy.screenshot()
+
+    assert await workflow() == "image-2"
+    workflow_id = (await DBOS.list_workflows_async())[0].workflow_id
+    events = await _stream_events(workflow_id, "audit")
+    assert [event["action"] for event in events] == ["type", "screenshot"]  # type: ignore[index]
+    assert all(event["source"] == "computer_use" for event in events)  # type: ignore[index]
+    assert "private typed text" not in str(events)
+    assert "image-2" not in str(events)
+    steps = await DBOS.list_workflow_steps_async(workflow_id)
+    replay = await DBOS.fork_workflow_async(workflow_id, steps[-1]["function_id"] + 1)
+    assert await replay.get_result() == "image-2"
+    assert computer.calls == [("type", "private typed text"), ("screenshot",)]
+
+
+@pytest.mark.asyncio
+async def test_dbos_computer_tool_wraps_factory_and_provider_disposes_original(
+    dbos_env: None,
+) -> None:
+    factory_computer = RecordingComputer()
+
+    def factory(*, run_context: RunContextWrapper[None]) -> RecordingComputer:
+        assert run_context.context is None
+        return factory_computer
+
+    factory_tool = DBOSComputerTool(ComputerTool(computer=factory))
+    factory_context = RunContextWrapper(None)
+    factory_proxy = await resolve_computer(
+        tool=factory_tool, run_context=factory_context
+    )
+    assert isinstance(factory_proxy, Computer)
+    assert factory_proxy is not factory_computer
+
+    disposed: list[Computer] = []
+    provider_computer = RecordingComputer()
+
+    def dispose(*, run_context: RunContextWrapper[None], computer: Computer) -> None:
+        assert run_context.context is None
+        disposed.append(computer)
+
+    provider_tool = DBOSComputerTool(
+        ComputerTool(
+            computer=ComputerProvider(
+                create=lambda run_context: provider_computer,
+                dispose=dispose,
+            )
+        )
+    )
+    provider_context = RunContextWrapper(None)
+    provider_proxy = await resolve_computer(
+        tool=provider_tool, run_context=provider_context
+    )
+    assert isinstance(provider_proxy, Computer)
+    assert provider_proxy is not provider_computer
+    await dispose_resolved_computers(run_context=provider_context)
+    assert disposed == [provider_computer]

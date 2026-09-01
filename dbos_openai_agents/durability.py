@@ -3,6 +3,9 @@
 from typing import Awaitable, Callable, Protocol, TypedDict, TypeVar
 
 from dbos import DBOS
+from dbos._context import snapshot_step_context
+from dbos._core import write_stream as write_stream_in_step
+from dbos._dbos import _get_dbos_instance
 
 DEFAULT_AUDIT_STREAM_KEY = "dbos-capability-events"
 
@@ -37,6 +40,13 @@ class _SyncTurnstile(Protocol):
 
 class _SyncActionState(Protocol):
     turnstile: _SyncTurnstile
+
+
+def _write_stream_sync(key: str, value: AuditEvent) -> None:
+    """Persist a sync-step audit event even when its workflow is async."""
+    write_stream_in_step(
+        _get_dbos_instance(), snapshot_step_context(reserve_sleep_id=False), key, value
+    )
 
 
 def _audit_event(
@@ -102,7 +112,7 @@ def _native_action_step_sync(
     try:
         result = invoke()
     except Exception:
-        DBOS.write_stream(
+        _write_stream_sync(
             audit_stream_key,
             _audit_event(
                 source=source,
@@ -114,7 +124,7 @@ def _native_action_step_sync(
         )
         raise
 
-    DBOS.write_stream(
+    _write_stream_sync(
         audit_stream_key,
         _audit_event(
             source=source,
