@@ -107,6 +107,9 @@ def instrument_tool(
         return _replace_on_invoke_tool(tool, invoke)
 
     if isinstance(tool, CustomTool):
+        custom_tool_names = getattr(state, "durable_custom_tool_names", None)
+        if isinstance(custom_tool_names, set):
+            custom_tool_names.add(tool.name)
         original = tool.on_invoke_tool
 
         async def invoke(context: ToolContext[Any], raw_input: str) -> Any:

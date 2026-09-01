@@ -14,10 +14,14 @@ from agents import (
 )
 from agents.items import ModelResponse
 from agents.stream_events import RawResponsesStreamEvent
-from agents.tool import function_tool
+from agents.tool import CustomTool, function_tool
 from agents.tool_guardrails import ToolInputGuardrailData, ToolOutputGuardrailData
 from dbos import DBOS
-from openai.types.responses import ResponseFunctionToolCall, ResponseTextDeltaEvent
+from openai.types.responses import (
+    ResponseCustomToolCall,
+    ResponseFunctionToolCall,
+    ResponseTextDeltaEvent,
+)
 from utils import FakeModel, make_message_response, make_tool_call_response
 
 from dbos_openai_agents import DBOSRunner
@@ -565,3 +569,63 @@ async def test_streamed_tool_call_replays_durably(dbos_env: None) -> None:
     assert replay_output == "The weather in NYC is sunny."
     assert tool_calls == ["NYC"]
     assert model.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_unwrapped_custom_tool_does_not_block_function_tool_turnstile(
+    dbos_env: None,
+) -> None:
+    """Ordinary custom tools must not consume a turnstile slot they cannot release."""
+    calls: list[str] = []
+
+    async def ordinary_custom(_: object, raw_input: str) -> str:
+        calls.append(f"custom:{raw_input}")
+        return "custom result"
+
+    @function_tool
+    async def ordinary_function() -> str:
+        """Return an ordinary local function result."""
+        calls.append("function")
+        return "function result"
+
+    custom_tool = CustomTool(
+        name="ordinary_custom",
+        description="An ordinary custom tool.",
+        on_invoke_tool=ordinary_custom,
+    )
+    model = FakeModel(
+        [
+            ModelResponse(
+                output=[
+                    ResponseCustomToolCall(
+                        type="custom_tool_call",
+                        call_id="custom",
+                        name="ordinary_custom",
+                        input="payload",
+                    ),
+                    ResponseFunctionToolCall(
+                        type="function_call",
+                        call_id="function",
+                        name="ordinary_function",
+                        arguments="{}",
+                    ),
+                ],
+                usage=Usage(),
+                response_id="resp_1",
+            ),
+            make_message_response("done"),
+        ]
+    )
+    agent = Agent(
+        name="mixed-tools",
+        model=model,
+        tools=[custom_tool, ordinary_function],
+    )
+
+    @DBOS.workflow()
+    async def workflow() -> str:
+        result = await DBOSRunner.run(agent, "run both tools")
+        return str(result.final_output)
+
+    assert await asyncio.wait_for(workflow(), timeout=1) == "done"
+    assert calls == ["custom:payload", "function"]

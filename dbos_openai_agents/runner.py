@@ -51,10 +51,11 @@ class Turnstile:
 
 
 class _State:
-    __slots__ = ("turnstile",)
+    __slots__ = ("turnstile", "durable_custom_tool_names")
 
     def __init__(self) -> None:
         self.turnstile = Turnstile([])
+        self.durable_custom_tool_names: set[str] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -78,13 +79,22 @@ async def _model_stream_step(
     return [event async for event in call_fn()]
 
 
-def _get_function_call_ids(output: List[TResponseOutputItem]) -> List[str]:
-    """Extract local tool call IDs from a model response."""
+def _get_function_call_ids(
+    output: List[TResponseOutputItem],
+    durable_custom_tool_names: set[str],
+) -> List[str]:
+    """Extract tool call IDs whose invocation wrappers release the turnstile."""
     call_ids: List[str] = []
     for item in output:
-        if item.type not in {"function_call", "custom_tool_call"}:
+        if item.type == "function_call":
+            call_id = getattr(item, "call_id", None)
+        elif (
+            item.type == "custom_tool_call"
+            and getattr(item, "name", None) in durable_custom_tool_names
+        ):
+            call_id = getattr(item, "call_id", None)
+        else:
             continue
-        call_id = getattr(item, "call_id", None)
         if isinstance(call_id, str):
             call_ids.append(call_id)
     return call_ids
@@ -117,7 +127,9 @@ class DBOSModelWrapper(Model):
         result: ModelResponse = await _model_call_step(call_llm)
 
         # Prepare the turnstile for any tool calls in the response
-        ids = _get_function_call_ids(result.output)
+        ids = _get_function_call_ids(
+            result.output, self._state.durable_custom_tool_names
+        )
         self._state.turnstile = Turnstile(ids)
 
         return result
@@ -133,7 +145,10 @@ class DBOSModelWrapper(Model):
             for event in events:
                 if event.type == "response.completed":
                     self._state.turnstile = Turnstile(
-                        _get_function_call_ids(event.response.output)
+                        _get_function_call_ids(
+                            event.response.output,
+                            self._state.durable_custom_tool_names,
+                        )
                     )
                 yield event
 
