@@ -20,3 +20,5 @@ def test_notebook_contains_all_agent_examples() -> None:
     assert "dbos.streams" in source
     assert "_native_action_step" in source
     assert "dbos-capability-events" in source
+    assert "sandbox_temporary_dir = tempfile.TemporaryDirectory(" in source
+    assert "sandbox_temporary_dir.cleanup()" in source
