@@ -72,6 +72,37 @@ See `notebooks/durable_agents_examples.ipynb` for regular, sandboxed, and
 agent-as-tool examples.
 
 
+## Durable nested agent tools
+
+Use `DBOSAgentTool` when a coordinator agent calls another agent as a function
+tool. It runs the nested agent through `DBOSRunner`, so its model calls are
+recorded as durable DBOS steps too.
+
+```python
+from agents import Agent
+from dbos import DBOS
+from dbos_openai_agents import DBOSAgentTool, DBOSRunner
+
+researcher = Agent(name="researcher")
+coordinator = Agent(
+    name="coordinator",
+    tools=[DBOSAgentTool(researcher, tool_name="ask_researcher", tool_description="Research a question.")],
+)
+
+@DBOS.workflow()
+async def coordinate(question: str) -> str:
+    result = await DBOSRunner.run(coordinator, question)
+    return str(result.final_output)
+```
+
+Plain `agent.as_tool()` does not make nested-agent execution durable through
+this package; use `DBOSAgentTool` for durable nested runs.
+
+Handoffs already receive recursive DBOS wrapping through `DBOSRunner`, so they
+do not need a separate handoff helper. If a `DBOSAgentTool` has a fixed
+`stream_key`, invoke that configured tool at most once per workflow; each
+invocation writes to the same DBOS stream key.
+
 ## Durable sandbox shell tools
 
 Wrap a capability that performs native actions with `DBOSCapability` and run the
@@ -107,6 +138,10 @@ payload-free `dbos-capability-events` record. Forking a completed workflow after
 last function ID reuses the saved operation output, so the shell command is not run
 again.
 
+If a failure occurs after a shell action completes but before DBOS persists the
+step's success result, a retry can run that external action again. Shell actions are
+therefore at-least-once and should be idempotent.
+
 `UnixLocalSandboxClient` is intended for local Unix development, not an isolation or
 deployment boundary for untrusted work. The audit stream contains action metadata
 only (source, owner, action, call ID, and status); command arguments and results are
@@ -116,16 +151,43 @@ and access controls.
 
 ## Streaming
 
-`DBOSRunner.run_streamed()` is a drop-in replacement for `Runner.run_streamed()`. Consume the returned result with `stream_events()` inside the workflow:
+`DBOSRunner.run_streamed()` is a drop-in replacement for `Runner.run_streamed()`.
+Inside the workflow, consume its result with `process_stream()` to persist selected events:
 
 ```python
+from dbos import DBOS, SetWorkflowID
+from dbos_openai_agents import DBOSRunner, process_stream
+
+AGENT_STREAM_KEY = "agent-events"
+
 @DBOS.workflow()
 async def stream_agent(user_input: str) -> str:
     result = DBOSRunner.run_streamed(agent, user_input)
-    async for event in result.stream_events():
-        # Handle the OpenAI Agents SDK stream event.
-        print(event)
+    async for event in process_stream(
+        result,
+        AGENT_STREAM_KEY,
+        include={"text", "reasoning", "tool_calls"},
+    ):
+        if (
+            event.type == "raw_response_event"
+            and event.data.type == "response.output_text.delta"
+        ):
+            print(event.data.delta, end="", flush=True)
     return str(result.final_output)
+
+
+with SetWorkflowID(request_id):
+    handle = await DBOS.start_workflow_async(stream_agent, user_input)
+
+async for event in DBOS.read_stream_async(handle.get_workflow_id(), AGENT_STREAM_KEY):
+    # `event` remains the original RawResponsesStreamEvent.
+    render(event)
 ```
 
 Each model response is persisted as a DBOS step before its events are yielded. This keeps replay durable, but events are emitted after their model-response step completes rather than token-by-token as they arrive from the provider.
+
+`process_stream()` yields every original Agents SDK event unchanged and copies only
+the requested raw Responses events to the caller-named DBOS stream. It can retain
+actual text, reasoning, and tool-call data, so protect the system database and stream
+readers appropriately. If the same completed `request_id` is started again, DBOS
+reuses the recorded workflow result rather than rerunning it.
