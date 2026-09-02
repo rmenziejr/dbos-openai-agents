@@ -22,6 +22,17 @@ def test_notebook_contains_all_agent_examples() -> None:
     assert "dbos-capability-events" in source
     assert "sandbox_temporary_dir = tempfile.TemporaryDirectory(" in source
     assert "sandbox_temporary_dir.cleanup()" in source
+    assert "stream_key=REGULAR_AGENT_STREAM_KEY" in source
+    assert "DBOS.read_stream_async(" in source
+    assert "handle.get_workflow_id()" in source
+    assert "SetWorkflowID" in source
+    assert "DBOS.start_workflow_async" in source
+    assert "response.output_text.delta" in source
+    assert "response.reasoning_text.delta" in source
+    assert "response.function_call_arguments.delta" in source
+    assert "process_stream" not in source
+    assert "await handle.get_result()" in source
+    assert "await replay_handle.get_result()" in source
     assert (
         source.index("sandbox_temporary_dir = tempfile.TemporaryDirectory(")
         < source.index("DBOS.fork_workflow_async")

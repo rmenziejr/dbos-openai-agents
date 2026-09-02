@@ -12,6 +12,7 @@ from agents import (
     TContext,
 )
 from agents.items import ModelResponse, TResponseOutputItem, TResponseStreamEvent
+from agents.stream_events import RawResponsesStreamEvent
 from agents.models.multi_provider import MultiProvider
 from agents.result import RunResultStreaming
 from agents.sandbox import SandboxAgent
@@ -51,11 +52,12 @@ class Turnstile:
 
 
 class _State:
-    __slots__ = ("turnstile", "durable_custom_tools")
+    __slots__ = ("turnstile", "durable_custom_tools", "stream_key")
 
-    def __init__(self) -> None:
+    def __init__(self, stream_key: str | None = None) -> None:
         self.turnstile = Turnstile([])
         self.durable_custom_tools: dict[int, CustomTool] = {}
+        self.stream_key = stream_key
 
 
 # ---------------------------------------------------------------------------
@@ -74,9 +76,22 @@ async def _model_call_step(
 @DBOS.step()
 async def _model_stream_step(
     call_fn: Callable[[], AsyncIterator[TResponseStreamEvent]],
+    stream_key: str | None,
 ) -> list[TResponseStreamEvent]:
-    """Collect a streamed LLM response in a durable DBOS step."""
-    return [event async for event in call_fn()]
+    """Write raw provider events live and retain their completed list in a DBOS step."""
+    events: list[TResponseStreamEvent] = []
+    try:
+        async for event in call_fn():
+            if stream_key is not None:
+                await DBOS.write_stream_async(
+                    stream_key, RawResponsesStreamEvent(data=event)
+                )
+            events.append(event)
+    except Exception as error:
+        # A DBOS step persists its own error, so discard provider exception
+        # chains that can retain non-pickleable resources.
+        raise RuntimeError(f"Agents SDK stream failed: {error}") from None
+    return events
 
 
 def _get_function_call_ids(
@@ -160,7 +175,7 @@ class DBOSModelWrapper(Model):
         model_tools = _get_model_tools(args, kwargs)
 
         async def stream() -> AsyncIterator[TResponseStreamEvent]:
-            events = await _model_stream_step(call_llm)
+            events = await _model_stream_step(call_llm, self._state.stream_key)
             for event in events:
                 if event.type == "response.completed":
                     self._state.turnstile = Turnstile(
@@ -302,16 +317,18 @@ class DBOSRunner:
         cls,
         starting_agent: Agent[TContext],
         input: str | list[Any],
+        stream_key: str | None = None,
         **kwargs: Any,
     ) -> RunResultStreaming:
         """Run an OpenAI agent with durable streamed model responses.
 
         Must be called from within a ``@DBOS.workflow()`` for durable execution.
-        Model events are persisted after each completed model response, then yielded
-        in their original order.
+        Raw provider events are written live as received when ``stream_key`` is set.
+        The completed event list is retained in the durable model step for SDK replay;
+        SDK events are yielded in their original order.
         """
 
-        state = _State()
+        state = _State(stream_key)
 
         run_config = kwargs.pop("run_config", RunConfig())
         run_config = dataclasses.replace(
@@ -321,12 +338,37 @@ class DBOSRunner:
 
         agent = _wrap_agent(starting_agent, state)
 
-        return Runner.run_streamed(
+        result = Runner.run_streamed(
             starting_agent=agent,
             input=input,
             run_config=run_config,
             **kwargs,
         )
+
+        original_stream_events = result.stream_events
+        stream_closed = False
+
+        async def stream_events() -> AsyncIterator[Any]:
+            nonlocal stream_closed
+            try:
+                async for event in original_stream_events():
+                    yield event
+            except Exception as error:
+                # Agents SDK tool errors can retain non-pickleable resources
+                # through exception chaining. DBOS persists workflow errors, so
+                # provide a plain, serializable exception instead.
+                if isinstance(error, RuntimeError) and str(error).startswith(
+                    "Agents SDK stream failed: "
+                ):
+                    raise error from None
+                raise RuntimeError(f"Agents SDK stream failed: {error}") from None
+            finally:
+                if stream_key is not None and not stream_closed:
+                    stream_closed = True
+                    await DBOS.close_stream_async(stream_key)
+
+        setattr(result, "stream_events", stream_events)
+        return result
 
     @classmethod
     def run_sync(

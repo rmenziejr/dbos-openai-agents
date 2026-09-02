@@ -7,7 +7,7 @@ from agents import Agent, RunConfig
 from agents.tool import FunctionTool, function_tool
 
 from .runner import DBOSRunner
-from .streaming import StreamEventKind, process_stream
+from .streaming import StreamEventKind
 
 
 def DBOSAgentTool(
@@ -19,7 +19,11 @@ def DBOSAgentTool(
     stream_key: str | None = None,
     include: Collection[StreamEventKind] = ("text", "reasoning", "tool_calls"),
 ) -> FunctionTool:
-    """Return a FunctionTool that runs a nested agent through DBOSRunner."""
+    """Return a FunctionTool that runs a nested agent through DBOSRunner.
+
+    When ``stream_key`` is configured, every raw provider event is persisted by
+    ``DBOSRunner``. ``include`` remains accepted for API compatibility only.
+    """
 
     @function_tool(
         name_override=tool_name,
@@ -34,8 +38,13 @@ def DBOSAgentTool(
             result = await DBOSRunner.run(agent, input, **run_kwargs)
             return str(result.final_output)
 
-        streaming_result = DBOSRunner.run_streamed(agent, input, **run_kwargs)
-        async for _ in process_stream(streaming_result, stream_key, include=include):
+        # The runner owns durable stream writes and closure. Retain ``include``
+        # only for backward-compatible calls; it cannot filter persisted raw events.
+        _ = include
+        streaming_result = DBOSRunner.run_streamed(
+            agent, input, stream_key=stream_key, **run_kwargs
+        )
+        async for _ in streaming_result.stream_events():
             pass
         return str(streaming_result.final_output)
 

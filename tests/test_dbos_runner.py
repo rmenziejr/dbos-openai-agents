@@ -1,4 +1,8 @@
 import asyncio
+from contextlib import suppress
+import pickle
+import threading
+from typing import Any, AsyncGenerator, AsyncIterator, cast
 
 import pytest
 from agents import (
@@ -12,19 +16,22 @@ from agents import (
     tool_input_guardrail,
     tool_output_guardrail,
 )
-from agents.items import ModelResponse
+from agents.items import ModelResponse, TResponseStreamEvent
 from agents.stream_events import RawResponsesStreamEvent
 from agents.tool import CustomTool, function_tool
+from agents.tool_context import ToolContext
 from agents.tool_guardrails import ToolInputGuardrailData, ToolOutputGuardrailData
-from dbos import DBOS
+from dbos import DBOS, SetWorkflowID
 from openai.types.responses import (
+    Response,
+    ResponseCompletedEvent,
     ResponseCustomToolCall,
     ResponseFunctionToolCall,
     ResponseTextDeltaEvent,
 )
 from utils import FakeModel, make_message_response, make_tool_call_response
 
-from dbos_openai_agents import DBOSRunner
+from dbos_openai_agents import DBOSAgentTool, DBOSRunner, process_stream
 
 
 @pytest.mark.asyncio
@@ -524,6 +531,130 @@ async def test_streamed_message(dbos_env: None) -> None:
 
 
 @pytest.mark.asyncio
+async def test_streamed_model_persists_text_before_response_completion(
+    dbos_env: None,
+) -> None:
+    """A raw text delta is durable before the streamed model response completes."""
+    allow_completion = asyncio.Event()
+
+    class BlockingStreamModel(FakeModel):
+        def stream_response(
+            self, *args: Any, **kwargs: Any
+        ) -> AsyncIterator[TResponseStreamEvent]:
+            response = self.responses[self.call_count]
+            self.call_count += 1
+
+            async def events() -> AsyncIterator[TResponseStreamEvent]:
+                yield ResponseTextDeltaEvent(
+                    type="response.output_text.delta",
+                    sequence_number=1,
+                    content_index=0,
+                    delta="Hello",
+                    item_id="msg_1",
+                    logprobs=[],
+                    output_index=0,
+                )
+                await allow_completion.wait()
+                yield ResponseCompletedEvent(
+                    type="response.completed",
+                    sequence_number=2,
+                    response=Response.model_construct(
+                        id=response.response_id,
+                        created_at=0.0,
+                        model="fake-model",
+                        object="response",
+                        output=response.output,
+                        parallel_tool_calls=False,
+                        tool_choice="auto",
+                        tools=[],
+                        usage=None,
+                    ),
+                )
+
+            return events()
+
+    agent = Agent(
+        name="test",
+        model=BlockingStreamModel([make_message_response("Hello!")]),
+    )
+
+    @DBOS.workflow()
+    async def wf(user_input: str) -> str:
+        result = DBOSRunner.run_streamed(agent, user_input, stream_key="agent-events")
+        async for _ in result.stream_events():
+            pass
+        return str(result.final_output)
+
+    handle = await DBOS.start_workflow_async(wf, "Hi")
+    first = await anext(
+        DBOS.read_stream_async(handle.get_workflow_id(), "agent-events")
+    )
+    assert isinstance(first, RawResponsesStreamEvent)
+    assert isinstance(first.data, ResponseTextDeltaEvent)
+    assert first.data.delta == "Hello"
+    assert not cast(Any, handle).task.done()
+
+    allow_completion.set()
+    assert await handle.get_result() == "Hello!"
+
+
+@pytest.mark.asyncio
+async def test_streamed_workflow_id_replays_typed_dbos_stream(dbos_env: None) -> None:
+    """A duplicate workflow ID replays the closed typed stream without a new model call."""
+    model = FakeModel(
+        [make_message_response("Hello!")],
+        stream_events=[
+            [
+                ResponseTextDeltaEvent(
+                    type="response.output_text.delta",
+                    sequence_number=1,
+                    content_index=0,
+                    delta="Hello",
+                    item_id="msg_1",
+                    logprobs=[],
+                    output_index=0,
+                )
+            ]
+        ],
+    )
+    agent = Agent(name="test", model=model)
+
+    @DBOS.workflow()
+    async def wf(user_input: str) -> str:
+        result = DBOSRunner.run_streamed(agent, user_input, stream_key="agent-events")
+        async for _ in result.stream_events():
+            pass
+        return str(result.final_output)
+
+    async def read_events(workflow_id: str) -> list[RawResponsesStreamEvent]:
+        return [
+            event async for event in DBOS.read_stream_async(workflow_id, "agent-events")
+        ]
+
+    with SetWorkflowID("request-1"):
+        first_handle = await DBOS.start_workflow_async(wf, "Hi")
+    first_events = await asyncio.wait_for(
+        read_events(first_handle.get_workflow_id()), timeout=5
+    )
+    assert await first_handle.get_result() == "Hello!"
+
+    with SetWorkflowID("request-1"):
+        second_handle = await DBOS.start_workflow_async(wf, "Hi")
+    second_events = await asyncio.wait_for(
+        read_events(second_handle.get_workflow_id()), timeout=5
+    )
+    assert await second_handle.get_result() == "Hello!"
+
+    assert first_events == second_events
+    assert all(isinstance(event, RawResponsesStreamEvent) for event in second_events)
+    assert [event.data.type for event in second_events] == [
+        "response.output_text.delta",
+        "response.completed",
+    ]
+    assert model.call_count == 1
+
+
+@pytest.mark.asyncio
 async def test_streamed_tool_call_replays_durably(dbos_env: None) -> None:
     """Streamed tool calls replay without recalling the model or tool."""
     tool_calls: list[str] = []
@@ -629,3 +760,271 @@ async def test_unwrapped_custom_tool_does_not_block_function_tool_turnstile(
 
     assert await asyncio.wait_for(workflow(), timeout=1) == "done"
     assert calls == ["custom:payload", "function"]
+
+
+@pytest.mark.asyncio
+async def test_process_stream_forwards_sdk_events_without_writing_or_closing_dbos_stream(
+    dbos_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The legacy helper drives an SDK stream but does not own DBOS transport."""
+    model = FakeModel(
+        [make_message_response("Hello!")],
+        stream_events=[
+            [
+                ResponseTextDeltaEvent(
+                    type="response.output_text.delta",
+                    sequence_number=1,
+                    content_index=0,
+                    delta="Hello",
+                    item_id="msg_1",
+                    logprobs=[],
+                    output_index=0,
+                )
+            ]
+        ],
+    )
+    agent = Agent(name="test", model=model)
+    write_calls: list[object] = []
+    close_calls: list[object] = []
+
+    async def write_stream(*args: object, **kwargs: object) -> None:
+        write_calls.append((args, kwargs))
+
+    async def close_stream(*args: object, **kwargs: object) -> None:
+        close_calls.append((args, kwargs))
+
+    monkeypatch.setattr(DBOS, "write_stream_async", write_stream)
+    monkeypatch.setattr(DBOS, "close_stream_async", close_stream)
+
+    @DBOS.workflow()
+    async def wf(user_input: str) -> list[str]:
+        result = DBOSRunner.run_streamed(agent, user_input)
+        return [
+            event.data.type
+            async for event in process_stream(result, "legacy-agent-events")
+            if isinstance(event, RawResponsesStreamEvent)
+        ]
+
+    assert await wf("Hi") == ["response.output_text.delta", "response.completed"]
+    assert write_calls == []
+    assert close_calls == []
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_stream_key_persists_typed_runner_events(
+    dbos_env: None,
+) -> None:
+    """A keyed nested agent delegates durable stream ownership to DBOSRunner."""
+    model = FakeModel(
+        [make_message_response("Hello!")],
+        stream_events=[
+            [
+                ResponseTextDeltaEvent(
+                    type="response.output_text.delta",
+                    sequence_number=1,
+                    content_index=0,
+                    delta="Hello",
+                    item_id="msg_1",
+                    logprobs=[],
+                    output_index=0,
+                )
+            ]
+        ],
+    )
+    tool = DBOSAgentTool(
+        Agent(name="nested", model=model),
+        tool_name="ask_nested",
+        tool_description="Ask the nested agent.",
+        stream_key="nested-agent-events",
+    )
+
+    @DBOS.workflow()
+    async def wf() -> str:
+        return str(
+            await tool.on_invoke_tool(
+                ToolContext(
+                    None,
+                    tool_name="ask_nested",
+                    tool_call_id="call_nested",
+                    tool_arguments='{"input":"Hi"}',
+                ),
+                '{"input":"Hi"}',
+            )
+        )
+
+    handle = await DBOS.start_workflow_async(wf)
+    events = await asyncio.wait_for(
+        collect_stream_events(handle.get_workflow_id(), "nested-agent-events"),
+        timeout=5,
+    )
+    assert await handle.get_result() == "Hello!"
+    assert all(isinstance(event, RawResponsesStreamEvent) for event in events)
+    assert [event.data.type for event in events] == [
+        "response.output_text.delta",
+        "response.completed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_process_stream_normalizes_nonserializable_errors() -> None:
+    """Compatibility forwarding raises a plain, serializable stream failure."""
+
+    class FailingResult:
+        async def stream_events(self) -> AsyncIterator[object]:
+            error = RuntimeError("boom")
+            error.lock = threading.Lock()  # type: ignore[attr-defined]
+            raise error
+            yield object()
+
+    with pytest.raises(RuntimeError, match="Agents SDK stream failed: boom") as raised:
+        async for _ in process_stream(cast(Any, FailingResult()), "legacy-events"):
+            pass
+
+    assert raised.value.__cause__ is None
+    pickle.dumps(raised.value)
+
+
+async def collect_stream_events(
+    workflow_id: str, stream_key: str
+) -> list[RawResponsesStreamEvent]:
+    return [event async for event in DBOS.read_stream_async(workflow_id, stream_key)]
+
+
+@pytest.mark.asyncio
+async def test_keyed_runner_forwards_raw_events_and_closes_once(
+    dbos_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runner-owned transport preserves SDK events and has one close owner."""
+    model = FakeModel(
+        [make_message_response("Hello!")],
+        stream_events=[
+            [
+                ResponseTextDeltaEvent(
+                    type="response.output_text.delta",
+                    sequence_number=1,
+                    content_index=0,
+                    delta="Hello",
+                    item_id="msg_1",
+                    logprobs=[],
+                    output_index=0,
+                )
+            ]
+        ],
+    )
+    close_calls: list[str] = []
+
+    async def close_stream(key: str) -> None:
+        close_calls.append(key)
+
+    monkeypatch.setattr(DBOS, "close_stream_async", close_stream)
+
+    @DBOS.workflow()
+    async def wf() -> list[RawResponsesStreamEvent]:
+        result = DBOSRunner.run_streamed(
+            Agent(name="test", model=model), "Hi", stream_key="runner-events"
+        )
+        return [
+            event
+            async for event in result.stream_events()
+            if isinstance(event, RawResponsesStreamEvent)
+        ]
+
+    events = await wf()
+    assert [event.data.type for event in events] == [
+        "response.output_text.delta",
+        "response.completed",
+    ]
+    assert close_calls == ["runner-events"]
+
+
+@pytest.mark.asyncio
+async def test_keyed_runner_normalizes_unpickleable_stream_error_and_closes_once(
+    dbos_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runner converts an SDK stream error before DBOS persists the workflow error."""
+
+    class FailingStreamModel(FakeModel):
+        def stream_response(
+            self, *args: Any, **kwargs: Any
+        ) -> AsyncIterator[TResponseStreamEvent]:
+            async def events() -> AsyncIterator[TResponseStreamEvent]:
+                error = RuntimeError("boom")
+                error.lock = threading.Lock()  # type: ignore[attr-defined]
+                raise error
+                yield cast(TResponseStreamEvent, None)
+
+            return events()
+
+    close_calls: list[str] = []
+
+    async def close_stream(key: str) -> None:
+        close_calls.append(key)
+
+    monkeypatch.setattr(DBOS, "close_stream_async", close_stream)
+    agent = Agent(name="test", model=FailingStreamModel([make_message_response("x")]))
+
+    @DBOS.workflow()
+    async def wf() -> str:
+        result = DBOSRunner.run_streamed(agent, "Hi", stream_key="runner-events")
+        with pytest.raises(
+            RuntimeError, match="Agents SDK stream failed: boom"
+        ) as raised:
+            async for _ in result.stream_events():
+                pass
+        assert raised.value.__cause__ is None
+        pickle.dumps(raised.value)
+        return str(raised.value)
+
+    assert await wf() == "Agents SDK stream failed: boom"
+    assert close_calls == ["runner-events"]
+
+
+@pytest.mark.asyncio
+async def test_keyed_runner_closes_once_when_stream_consumer_is_cancelled(
+    dbos_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancelling the real runner event consumer still releases its DBOS stream."""
+    entered_stream = asyncio.Event()
+    block_stream = asyncio.Event()
+
+    class BlockingStreamModel(FakeModel):
+        def stream_response(
+            self, *args: Any, **kwargs: Any
+        ) -> AsyncIterator[TResponseStreamEvent]:
+            async def events() -> AsyncIterator[TResponseStreamEvent]:
+                yield ResponseTextDeltaEvent(
+                    type="response.output_text.delta",
+                    sequence_number=1,
+                    content_index=0,
+                    delta="Hello",
+                    item_id="msg_1",
+                    logprobs=[],
+                    output_index=0,
+                )
+                entered_stream.set()
+                await block_stream.wait()
+
+            return events()
+
+    close_calls: list[str] = []
+
+    async def close_stream(key: str) -> None:
+        close_calls.append(key)
+
+    monkeypatch.setattr(DBOS, "close_stream_async", close_stream)
+    agent = Agent(name="test", model=BlockingStreamModel([make_message_response("x")]))
+
+    @DBOS.workflow()
+    async def wf() -> None:
+        result = DBOSRunner.run_streamed(agent, "Hi", stream_key="runner-events")
+        event_stream = cast(AsyncGenerator[Any, None], result.stream_events())
+        consumer: asyncio.Future[Any] = asyncio.ensure_future(anext(event_stream))
+        await entered_stream.wait()
+        consumer.cancel()
+        with suppress(asyncio.CancelledError):
+            await consumer
+        await event_stream.aclose()
+
+    await asyncio.wait_for(wf(), timeout=2)
+    assert close_calls == ["runner-events"]

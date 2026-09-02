@@ -151,43 +151,36 @@ and access controls.
 
 ## Streaming
 
-`DBOSRunner.run_streamed()` is a drop-in replacement for `Runner.run_streamed()`.
-Inside the workflow, consume its result with `process_stream()` to persist selected events:
+`DBOSRunner.run_streamed()` is a drop-in replacement for `Runner.run_streamed()`. Pass an optional stream key to write every raw, typed `RawResponsesStreamEvent` live as the provider emits it (including `response.completed`) and close that DBOS stream when SDK consumption finishes. The completed raw-event list is also stored in the durable model step so the Agents SDK can replay execution.
 
 ```python
+from agents.stream_events import RawResponsesStreamEvent
 from dbos import DBOS, SetWorkflowID
-from dbos_openai_agents import DBOSRunner, process_stream
+from dbos_openai_agents import DBOSRunner
 
 AGENT_STREAM_KEY = "agent-events"
 
 @DBOS.workflow()
 async def stream_agent(user_input: str) -> str:
-    result = DBOSRunner.run_streamed(agent, user_input)
-    async for event in process_stream(
-        result,
-        AGENT_STREAM_KEY,
-        include={"text", "reasoning", "tool_calls"},
-    ):
-        if (
-            event.type == "raw_response_event"
-            and event.data.type == "response.output_text.delta"
-        ):
-            print(event.data.delta, end="", flush=True)
+    result = DBOSRunner.run_streamed(
+        agent, user_input, stream_key=AGENT_STREAM_KEY
+    )
+    # Drive the agent; render only from the durable DBOS stream below.
+    async for _ in result.stream_events():
+        pass
     return str(result.final_output)
-
 
 with SetWorkflowID(request_id):
     handle = await DBOS.start_workflow_async(stream_agent, user_input)
 
 async for event in DBOS.read_stream_async(handle.get_workflow_id(), AGENT_STREAM_KEY):
-    # `event` remains the original RawResponsesStreamEvent.
+    assert isinstance(event, RawResponsesStreamEvent)
     render(event)
+
+# Surface a terminal workflow failure after stream consumption.
+await handle.get_result()
 ```
 
-Each model response is persisted as a DBOS step before its events are yielded. This keeps replay durable, but events are emitted after their model-response step completes rather than token-by-token as they arrive from the provider.
+Raw provider events are written to the keyed DBOS stream live as they arrive. Separately, each completed model response stores its complete raw-event list in a durable model step for Agents SDK execution replay.
 
-`process_stream()` yields every original Agents SDK event unchanged and copies only
-the requested raw Responses events to the caller-named DBOS stream. It can retain
-actual text, reasoning, and tool-call data, so protect the system database and stream
-readers appropriately. If the same completed `request_id` is started again, DBOS
-reuses the recorded workflow result rather than rerunning it.
+`process_stream()` remains an optional compatibility helper for forwarding an Agents SDK result stream. It does not write or close DBOS streams; use `run_streamed(..., stream_key=...)` and `DBOS.read_stream_async()` for durable streaming. Typed event payloads can contain text, reasoning, and tool-call data, so protect the system database and stream readers appropriately. If the same completed `request_id` is started again, DBOS reuses the recorded workflow result rather than rerunning it.
