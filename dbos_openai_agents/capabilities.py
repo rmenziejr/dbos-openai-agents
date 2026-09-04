@@ -1,7 +1,5 @@
 """Durable wrappers for sandbox capabilities."""
 
-import copy
-import dataclasses
 from typing import Any
 
 from agents.sandbox.capabilities import Capability
@@ -134,11 +132,7 @@ def _replace_on_invoke_tool(
     on_invoke_tool: Any,
 ) -> FunctionTool | CustomTool:
     """Copy a local tool without mutating the capability-provided instance."""
-    try:
-        return dataclasses.replace(tool, on_invoke_tool=on_invoke_tool)
-    except TypeError:
-        # Sandbox tool subclasses use custom constructors that cannot be called by
-        # dataclasses.replace. Preserve every field and change only the callback.
-        cloned = copy.copy(tool)
-        cloned.on_invoke_tool = on_invoke_tool
-        return cloned
+    cloned = object.__new__(type(tool))
+    cloned.__dict__.update(tool.__dict__)
+    cloned.on_invoke_tool = on_invoke_tool
+    return cloned
