@@ -531,6 +531,87 @@ async def test_streamed_message(dbos_env: None) -> None:
 
 
 @pytest.mark.asyncio
+async def test_streamed_message_retries_an_empty_provider_stream(
+    dbos_env: None,
+) -> None:
+    """An empty provider stream is retried before the SDK rejects the turn."""
+
+    class EmptyThenCompletedStreamModel(FakeModel):
+        def stream_response(
+            self, *args: Any, **kwargs: Any
+        ) -> AsyncIterator[TResponseStreamEvent]:
+            if self.call_count == 0:
+                self.call_count += 1
+
+                async def empty_events() -> AsyncIterator[TResponseStreamEvent]:
+                    if False:
+                        yield cast(TResponseStreamEvent, None)
+
+                return empty_events()
+            return super().stream_response(*args, **kwargs)
+
+    model = EmptyThenCompletedStreamModel(
+        [make_message_response("discarded"), make_message_response("Hello!")]
+    )
+    agent = Agent(name="test", model=model)
+
+    @DBOS.workflow()
+    async def wf(user_input: str) -> str:
+        result = DBOSRunner.run_streamed(agent, user_input)
+        async for _ in result.stream_events():
+            pass
+        return str(result.final_output)
+
+    assert await wf("Hi") == "Hello!"
+    assert model.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_streamed_message_reports_empty_stream_after_retry(
+    dbos_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two empty attempts report a serializable incomplete stream failure."""
+
+    class EmptyStreamModel(FakeModel):
+        def stream_response(
+            self, *args: Any, **kwargs: Any
+        ) -> AsyncIterator[TResponseStreamEvent]:
+            self.call_count += 1
+
+            async def empty_events() -> AsyncIterator[TResponseStreamEvent]:
+                if False:
+                    yield cast(TResponseStreamEvent, None)
+
+            return empty_events()
+
+    close_calls: list[str] = []
+
+    async def close_stream(key: str) -> None:
+        close_calls.append(key)
+
+    monkeypatch.setattr(DBOS, "close_stream_async", close_stream)
+    model = EmptyStreamModel([make_message_response("discarded")] * 2)
+
+    @DBOS.workflow()
+    async def wf() -> None:
+        result = DBOSRunner.run_streamed(
+            Agent(name="test", model=model), "Hi", stream_key="agent-events"
+        )
+        async for _ in result.stream_events():
+            pass
+
+    with pytest.raises(
+        RuntimeError,
+        match="Agents SDK stream failed: Model stream ended without events after retry",
+    ) as raised:
+        await wf()
+
+    assert raised.value.__cause__ is None
+    assert model.call_count == 2
+    assert close_calls == ["agent-events"]
+
+
+@pytest.mark.asyncio
 async def test_streamed_model_persists_text_before_response_completion(
     dbos_env: None,
 ) -> None:

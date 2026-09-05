@@ -78,20 +78,24 @@ async def _model_stream_step(
     call_fn: Callable[[], AsyncIterator[TResponseStreamEvent]],
     stream_key: str | None,
 ) -> list[TResponseStreamEvent]:
-    """Write raw provider events live and retain their completed list in a DBOS step."""
-    events: list[TResponseStreamEvent] = []
-    try:
-        async for event in call_fn():
-            if stream_key is not None:
-                await DBOS.write_stream_async(
-                    stream_key, RawResponsesStreamEvent(data=event)
-                )
-            events.append(event)
-    except Exception as error:
-        # A DBOS step persists its own error, so discard provider exception
-        # chains that can retain non-pickleable resources.
-        raise RuntimeError(f"Agents SDK stream failed: {error}") from None
-    return events
+    """Write provider events live and retry one empty stream before failing."""
+    for _ in range(2):
+        events: list[TResponseStreamEvent] = []
+        try:
+            async for event in call_fn():
+                if stream_key is not None:
+                    await DBOS.write_stream_async(
+                        stream_key, RawResponsesStreamEvent(data=event)
+                    )
+                events.append(event)
+        except Exception as error:
+            # A DBOS step persists its own error, so discard provider exception
+            # chains that can retain non-pickleable resources.
+            raise RuntimeError(f"Agents SDK stream failed: {error}") from None
+        if events:
+            return events
+
+    raise RuntimeError("Model stream ended without events after retry")
 
 
 def _get_function_call_ids(
