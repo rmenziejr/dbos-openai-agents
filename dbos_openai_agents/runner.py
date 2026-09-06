@@ -1,6 +1,6 @@
 import dataclasses
 from asyncio import Event
-from typing import Any, AsyncIterator, Awaitable, Callable, List
+from typing import Any, AsyncIterator, Awaitable, Callable, List, Literal
 
 from agents import (
     Agent,
@@ -267,6 +267,73 @@ def _wrap_handoff(handoff: Handoff[TContext], state: _State) -> Handoff[TContext
     return dataclasses.replace(handoff, on_invoke_handoff=wrapped)
 
 
+ReplayMode = Literal["raw", "compact"]
+_DELTA_IDENTITY_FIELDS = (
+    "type",
+    "item_id",
+    "output_index",
+    "content_index",
+    "summary_index",
+    "call_id",
+)
+
+
+def _delta_group_key(event: Any) -> tuple[Any, ...] | None:
+    """Return a stable identity for a compactable raw SDK delta event."""
+    if not isinstance(event, RawResponsesStreamEvent):
+        return None
+
+    data = event.data
+    if not isinstance(getattr(data, "delta", None), str):
+        return None
+
+    return tuple(getattr(data, field, None) for field in _DELTA_IDENTITY_FIELDS)
+
+
+def _merge_delta_events(events: list[Any]) -> Any:
+    """Merge one logical run of raw SDK delta events into the final event shape."""
+    last = events[-1]
+    data = last.data
+    merged_delta = "".join(event.data.delta for event in events)
+    merged_data = data.model_copy(update={"delta": merged_delta})
+    return RawResponsesStreamEvent(data=merged_data)
+
+
+def _compact_replay_events(
+    events: list[tuple[int, Any]],
+) -> list[tuple[int, Any]]:
+    """Compact consecutive compatible deltas while preserving event order."""
+    compacted: list[tuple[int, Any]] = []
+    pending: list[tuple[int, Any]] = []
+    pending_key: tuple[Any, ...] | None = None
+
+    def flush() -> None:
+        nonlocal pending, pending_key
+        if pending:
+            compacted.append(
+                (pending[-1][0], _merge_delta_events([event for _, event in pending]))
+            )
+            pending = []
+            pending_key = None
+
+    for cursor, event in events:
+        key = _delta_group_key(event)
+        if key is None:
+            flush()
+            compacted.append((cursor, event))
+        elif pending and key != pending_key:
+            flush()
+            pending = [(cursor, event)]
+            pending_key = key
+        else:
+            if not pending:
+                pending_key = key
+            pending.append((cursor, event))
+
+    flush()
+    return compacted
+
+
 # DBOSRunner
 
 
@@ -373,16 +440,40 @@ class DBOSRunner:
         stream_key: str,
         *,
         offset: int = 0,
+        replay: ReplayMode = "raw",
     ) -> AsyncIterator[tuple[int, Any]]:
         """Replay and follow a durable DBOS stream from a consumer cursor.
 
-        ``offset`` is the number of values already consumed. Each yielded tuple
-        contains the next resumable offset and the corresponding stream value.
-        Attaching only observes an existing stream; it never starts or recovers
-        the workflow that owns it.
+        ``offset`` is the number of values already consumed. In ``raw`` mode,
+        those values are skipped and reading starts directly at ``offset``. In
+        ``compact`` mode, values before ``offset`` are replayed as compacted
+        logical delta blocks before normal one-event streaming resumes at the
+        supplied offset.
         """
         if offset < 0:
             raise ValueError("offset must be non-negative")
+        if replay not in ("raw", "compact"):
+            raise ValueError("replay must be 'raw' or 'compact'")
+
+        if replay == "compact" and offset > 0:
+            historical: list[tuple[int, Any]] = []
+            historical_stream = DBOS.read_stream_async(
+                workflow_id,
+                stream_key,
+                offset=0,
+            )
+            try:
+                cursor = 0
+                async for event in historical_stream:
+                    cursor += 1
+                    historical.append((cursor, event))
+                    if cursor >= offset:
+                        break
+            finally:
+                await historical_stream.aclose()
+
+            for item in _compact_replay_events(historical):
+                yield item
 
         next_offset = offset
         async for event in DBOS.read_stream_async(
