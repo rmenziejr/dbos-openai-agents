@@ -71,7 +71,6 @@ before running the notebook. Stop the environment with `docker compose down`.
 See `notebooks/durable_agents_examples.ipynb` for regular, sandboxed, and
 agent-as-tool examples.
 
-
 ## Durable nested agent tools
 
 Use `DBOSAgentTool` when a coordinator agent calls another agent as a function
@@ -151,10 +150,13 @@ and access controls.
 
 ## Streaming
 
-`DBOSRunner.run_streamed()` is a drop-in replacement for `Runner.run_streamed()`. Pass an optional stream key to write every raw, typed `RawResponsesStreamEvent` live as the provider emits it (including `response.completed`) and close that DBOS stream when SDK consumption finishes. The completed raw-event list is also stored in the durable model step so the Agents SDK can replay execution.
+`DBOSRunner.run_streamed()` is a drop-in replacement for `Runner.run_streamed()`.
+Pass a `stream_key` to persist every typed `RawResponsesStreamEvent` live as the
+provider emits it, including `response.completed`. The completed raw-event list is
+also stored in the durable model step so the Agents SDK can replay completed model
+calls without calling the provider again.
 
 ```python
-from agents.stream_events import RawResponsesStreamEvent
 from dbos import DBOS, SetWorkflowID
 from dbos_openai_agents import DBOSRunner
 
@@ -163,24 +165,107 @@ AGENT_STREAM_KEY = "agent-events"
 @DBOS.workflow()
 async def stream_agent(user_input: str) -> str:
     result = DBOSRunner.run_streamed(
-        agent, user_input, stream_key=AGENT_STREAM_KEY
+        agent,
+        user_input,
+        stream_key=AGENT_STREAM_KEY,
     )
-    # Drive the agent; render only from the durable DBOS stream below.
+    # Drive the Agents SDK stream. Render from the durable DBOS stream instead.
     async for _ in result.stream_events():
         pass
     return str(result.final_output)
 
 with SetWorkflowID(request_id):
     handle = await DBOS.start_workflow_async(stream_agent, user_input)
-
-async for event in DBOS.read_stream_async(handle.get_workflow_id(), AGENT_STREAM_KEY):
-    assert isinstance(event, RawResponsesStreamEvent)
-    render(event)
-
-# Surface a terminal workflow failure after stream consumption.
-await handle.get_result()
 ```
 
-Raw provider events are written to the keyed DBOS stream live as they arrive. Separately, each completed model response stores its complete raw-event list in a durable model step for Agents SDK execution replay.
+### Attaching and resuming
 
-`process_stream()` remains an optional compatibility helper for forwarding an Agents SDK result stream. It does not write or close DBOS streams; use `run_streamed(..., stream_key=...)` and `DBOS.read_stream_async()` for durable streaming. Typed event payloads can contain text, reasoning, and tool-call data, so protect the system database and stream readers appropriately. If the same completed `request_id` is started again, DBOS reuses the recorded workflow result rather than rerunning it.
+Use `DBOSRunner.attach_stream()` to consume the durable stream. It returns
+`(offset, event)` tuples, where `offset` is the next resumable DBOS stream position.
+Persist the last successfully applied offset and supply it when reconnecting.
+
+```python
+last_offset = 0
+
+async for last_offset, event in DBOSRunner.attach_stream(
+    handle.get_workflow_id(),
+    AGENT_STREAM_KEY,
+    offset=last_offset,
+):
+    render(event)
+```
+
+The default `replay="raw"` mode skips directly to the supplied offset. This is the
+normal reconnect path when the caller already rendered everything before that
+cursor.
+
+`replay="compact"` rebuilds historical UI state efficiently: it reads events from
+stream offset 0 through the supplied offset, merges consecutive compatible SDK
+string-delta events into ordered logical blocks, emits those compacted blocks with
+the cursor of the final raw event they represent, and then resumes ordinary
+one-event streaming from the supplied offset.
+
+```python
+async for cursor, event in DBOSRunner.attach_stream(
+    handle.get_workflow_id(),
+    AGENT_STREAM_KEY,
+    offset=last_offset,
+    replay="compact",
+):
+    render(event)
+```
+
+Compaction preserves event order and logical boundaries. Reasoning deltas, output
+text deltas, and streamed tool-call arguments are compacted only while consecutive
+and associated with the same SDK event identity. Lifecycle and non-delta events
+remain separate.
+
+### Timeouts and polling
+
+`attach_stream()` passes `polling_interval_sec` and `timeout_seconds` directly to
+DBOS stream reads. A timeout is an inter-event timeout: DBOS restarts the timeout
+after each value is received.
+
+```python
+async for cursor, event in DBOSRunner.attach_stream(
+    handle.get_workflow_id(),
+    AGENT_STREAM_KEY,
+    offset=last_offset,
+    polling_interval_sec=0.25,
+    timeout_seconds=30,
+):
+    render(event)
+```
+
+This is useful for detecting a producer that has stopped delivering events without
+placing a total-duration limit on a long-running agent.
+
+### Recovery and duplicate-prefix protection
+
+DBOS guarantees exactly-once stream writes when `DBOS.write_stream()` is called
+from workflow code, but writes made from a step are at-least-once. The provider
+stream must execute inside a durable model step so completed model calls can replay
+without another provider request while still delivering tokens live.
+
+To avoid duplicating a prefix when DBOS recovers an incomplete model-stream step,
+this package tracks the expected global stream offset. At the beginning of a model
+stream it probes the expected offset. If values from the interrupted attempt are
+already present, the recovered step consumes and skips those already-persisted
+positions until it reaches the first missing offset, then resumes ordinary live
+writes. On a fresh model stream only the first expected offset is probed, so normal
+streaming does not perform a database read for every token.
+
+This protects the common executor-crash/recovery case while preserving live token
+streaming. It is not a stronger guarantee than DBOS itself under concurrent or
+"zombie" executions: two executors racing before either write becomes visible can
+still produce at-least-once step writes. Consumers that need DBOS's native
+exactly-once guarantee must perform their stream writes directly from workflow code.
+
+The stream is closed when SDK stream consumption finishes. After consuming the
+stream, call `handle.get_result()` to surface any terminal workflow error.
+
+`process_stream()` remains an optional compatibility helper for forwarding an
+Agents SDK result stream. It does not write or close DBOS streams; use
+`run_streamed(..., stream_key=...)` and `DBOSRunner.attach_stream()` for durable,
+resumable streaming. Typed event payloads can contain text, reasoning, and tool-call
+data, so protect the system database and stream readers appropriately.
