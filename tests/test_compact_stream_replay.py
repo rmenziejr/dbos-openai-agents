@@ -70,6 +70,8 @@ async def test_attach_stream_raw_skips_directly_to_offset(
         stream_key: str,
         *,
         offset: int = 0,
+        polling_interval_sec: float | None = None,
+        timeout_seconds: float | None = None,
     ):
         calls.append(offset)
         yield "live-1"
@@ -108,6 +110,8 @@ async def test_attach_stream_compacts_zero_to_offset_then_resumes_raw(
         stream_key: str,
         *,
         offset: int = 0,
+        polling_interval_sec: float | None = None,
+        timeout_seconds: float | None = None,
     ):
         calls.append(offset)
         if offset == 0:
@@ -147,6 +151,8 @@ async def test_attach_stream_compact_with_zero_offset_streams_raw_once(
         stream_key: str,
         *,
         offset: int = 0,
+        polling_interval_sec: float | None = None,
+        timeout_seconds: float | None = None,
     ):
         calls.append(offset)
         yield "live"
