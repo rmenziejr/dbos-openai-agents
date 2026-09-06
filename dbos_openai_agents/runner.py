@@ -23,9 +23,7 @@ from dbos import DBOS
 
 from .capabilities import DBOSCapability
 
-# ---------------------------------------------------------------------------
 # Turnstile: ordered execution of concurrent async operations
-# ---------------------------------------------------------------------------
 
 
 class Turnstile:
@@ -60,9 +58,7 @@ class _State:
         self.stream_key = stream_key
 
 
-# ---------------------------------------------------------------------------
 # Model wrapping
-# ---------------------------------------------------------------------------
 
 
 @DBOS.step()
@@ -194,9 +190,7 @@ class DBOSModelWrapper(Model):
         return stream()
 
 
-# ---------------------------------------------------------------------------
 # Tool wrapping
-# ---------------------------------------------------------------------------
 
 
 def _create_tool_wrapper(
@@ -273,9 +267,7 @@ def _wrap_handoff(handoff: Handoff[TContext], state: _State) -> Handoff[TContext
     return dataclasses.replace(handoff, on_invoke_handoff=wrapped)
 
 
-# ---------------------------------------------------------------------------
 # DBOSRunner
-# ---------------------------------------------------------------------------
 
 
 class DBOSRunner:
@@ -373,6 +365,33 @@ class DBOSRunner:
 
         setattr(result, "stream_events", stream_events)
         return result
+
+    @classmethod
+    async def attach_stream(
+        cls,
+        workflow_id: str,
+        stream_key: str,
+        *,
+        offset: int = 0,
+    ) -> AsyncIterator[tuple[int, Any]]:
+        """Replay and follow a durable DBOS stream from a consumer cursor.
+
+        ``offset`` is the number of values already consumed. Each yielded tuple
+        contains the next resumable offset and the corresponding stream value.
+        Attaching only observes an existing stream; it never starts or recovers
+        the workflow that owns it.
+        """
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
+
+        next_offset = offset
+        async for event in DBOS.read_stream_async(
+            workflow_id,
+            stream_key,
+            offset=offset,
+        ):
+            next_offset += 1
+            yield next_offset, event
 
     @classmethod
     def run_sync(
