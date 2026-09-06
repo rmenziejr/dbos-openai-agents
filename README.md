@@ -256,10 +256,12 @@ writes. On a fresh model stream only the first expected offset is probed, so nor
 streaming does not perform a database read for every token.
 
 This protects the common executor-crash/recovery case while preserving live token
-streaming. It is not a stronger guarantee than DBOS itself under concurrent or
-"zombie" executions: two executors racing before either write becomes visible can
-still produce at-least-once step writes. Consumers that need DBOS's native
-exactly-once guarantee must perform their stream writes directly from workflow code.
+streaming. A narrow edge case remains under concurrent or "zombie" execution: two
+executors can race before either write becomes visible and DBOS step stream writes
+are still at-least-once, so duplicate transient stream events are possible. The
+durable Agents SDK session/response state remains the source of truth once a
+response completes; the DBOS stream is used for live delivery and reconnect state,
+not as the authoritative completed response record.
 
 The stream is closed when SDK stream consumption finishes. After consuming the
 stream, call `handle.get_result()` to surface any terminal workflow error.
