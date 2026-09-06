@@ -19,7 +19,7 @@ from agents.sandbox import SandboxAgent
 from agents.sandbox.capabilities import Capability
 from agents.tool import CustomTool, FunctionTool, Tool
 from agents.tool_context import ToolContext
-from dbos import DBOS
+from dbos import DBOS, error as dboserror
 
 from .capabilities import DBOSCapability
 
@@ -50,12 +50,13 @@ class Turnstile:
 
 
 class _State:
-    __slots__ = ("turnstile", "durable_custom_tools", "stream_key")
+    __slots__ = ("turnstile", "durable_custom_tools", "stream_key", "stream_offset")
 
     def __init__(self, stream_key: str | None = None) -> None:
         self.turnstile = Turnstile([])
         self.durable_custom_tools: dict[int, CustomTool] = {}
         self.stream_key = stream_key
+        self.stream_offset = 0
 
 
 # Model wrapping
@@ -69,21 +70,69 @@ async def _model_call_step(
     return await call_fn()
 
 
+async def _consume_model_stream(
+    call_fn: Callable[[], AsyncIterator[TResponseStreamEvent]],
+    *,
+    stream_key: str | None,
+    stream_offset: int,
+    workflow_id: str | None,
+) -> list[TResponseStreamEvent]:
+    """Consume one provider stream while avoiding duplicate recovery-prefix writes.
+
+    DBOS stream writes made from a step are at-least-once. On workflow recovery,
+    an incomplete model step may therefore re-run after already writing a prefix
+    of its provider events. Probe the expected stream offset until the first gap;
+    already-present offsets are replayed without another write, and after the gap
+    all subsequent provider events are written live without additional probes.
+    """
+    events: list[TResponseStreamEvent] = []
+    probe_existing = stream_key is not None
+    next_offset = stream_offset
+
+    if stream_key is not None and workflow_id is None:
+        raise RuntimeError("DBOS workflow ID is unavailable while streaming")
+
+    async for event in call_fn():
+        if stream_key is not None:
+            should_write = True
+            if probe_existing:
+                try:
+                    await DBOS.read_stream_offset_async(
+                        workflow_id,
+                        stream_key,
+                        next_offset,
+                        timeout_seconds=0.001,
+                    )
+                    should_write = False
+                except dboserror.DBOSStreamTimeoutError:
+                    probe_existing = False
+
+            if should_write:
+                await DBOS.write_stream_async(
+                    stream_key, RawResponsesStreamEvent(data=event)
+                )
+
+        events.append(event)
+        next_offset += 1
+
+    return events
+
+
 @DBOS.step()
 async def _model_stream_step(
     call_fn: Callable[[], AsyncIterator[TResponseStreamEvent]],
     stream_key: str | None,
+    stream_offset: int,
 ) -> list[TResponseStreamEvent]:
     """Write provider events live and retry one empty stream before failing."""
     for _ in range(2):
-        events: list[TResponseStreamEvent] = []
         try:
-            async for event in call_fn():
-                if stream_key is not None:
-                    await DBOS.write_stream_async(
-                        stream_key, RawResponsesStreamEvent(data=event)
-                    )
-                events.append(event)
+            events = await _consume_model_stream(
+                call_fn,
+                stream_key=stream_key,
+                stream_offset=stream_offset,
+                workflow_id=DBOS.workflow_id,
+            )
         except Exception as error:
             # A DBOS step persists its own error, so discard provider exception
             # chains that can retain non-pickleable resources.
@@ -175,7 +224,12 @@ class DBOSModelWrapper(Model):
         model_tools = _get_model_tools(args, kwargs)
 
         async def stream() -> AsyncIterator[TResponseStreamEvent]:
-            events = await _model_stream_step(call_llm, self._state.stream_key)
+            events = await _model_stream_step(
+                call_llm,
+                self._state.stream_key,
+                self._state.stream_offset,
+            )
+            self._state.stream_offset += len(events)
             for event in events:
                 if event.type == "response.completed":
                     self._state.turnstile = Turnstile(
@@ -441,6 +495,8 @@ class DBOSRunner:
         *,
         offset: int = 0,
         replay: ReplayMode = "raw",
+        polling_interval_sec: float | None = None,
+        timeout_seconds: float | None = None,
     ) -> AsyncIterator[tuple[int, Any]]:
         """Replay and follow a durable DBOS stream from a consumer cursor.
 
@@ -448,7 +504,8 @@ class DBOSRunner:
         those values are skipped and reading starts directly at ``offset``. In
         ``compact`` mode, values before ``offset`` are replayed as compacted
         logical delta blocks before normal one-event streaming resumes at the
-        supplied offset.
+        supplied offset. Polling and timeout options are passed through to DBOS;
+        the timeout applies to each awaited stream value.
         """
         if offset < 0:
             raise ValueError("offset must be non-negative")
@@ -461,6 +518,8 @@ class DBOSRunner:
                 workflow_id,
                 stream_key,
                 offset=0,
+                polling_interval_sec=polling_interval_sec,
+                timeout_seconds=timeout_seconds,
             )
             try:
                 cursor = 0
@@ -480,6 +539,8 @@ class DBOSRunner:
             workflow_id,
             stream_key,
             offset=offset,
+            polling_interval_sec=polling_interval_sec,
+            timeout_seconds=timeout_seconds,
         ):
             next_offset += 1
             yield next_offset, event
