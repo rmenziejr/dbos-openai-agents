@@ -3,7 +3,7 @@ import asyncio
 import pytest
 from dbos import DBOS
 
-from dbos_openai_agents import DBOSRunner
+from dbos_openai_agents.runner import DBOSRunner
 
 
 @pytest.mark.asyncio
