@@ -321,7 +321,7 @@ def _wrap_handoff(handoff: Handoff[TContext], state: _State) -> Handoff[TContext
     return dataclasses.replace(handoff, on_invoke_handoff=wrapped)
 
 
-ReplayMode = Literal["raw", "compact"]
+ReplayMode = Literal["raw", "compact", "compact_tail"]
 _DELTA_IDENTITY_FIELDS = (
     "type",
     "item_id",
@@ -386,6 +386,32 @@ def _compact_replay_events(
 
     flush()
     return compacted
+
+
+async def _discover_compact_tail(
+    workflow_id: str,
+    stream_key: str,
+    *,
+    offset: int,
+    stride: int,
+    attempts: int,
+    timeout_seconds: float,
+) -> int:
+    """Return a bounded near-tail cursor using sparse single-offset probes."""
+    boundary = offset
+    for attempt in range(1, attempts + 1):
+        probe_offset = offset + stride * attempt
+        try:
+            await DBOS.read_stream_offset_async(
+                workflow_id,
+                stream_key,
+                probe_offset,
+                timeout_seconds=timeout_seconds,
+            )
+        except dboserror.DBOSStreamTimeoutError:
+            break
+        boundary = probe_offset + 1
+    return boundary
 
 
 # DBOSRunner
@@ -497,22 +523,44 @@ class DBOSRunner:
         replay: ReplayMode = "raw",
         polling_interval_sec: float | None = None,
         timeout_seconds: float | None = None,
+        tail_probe_stride: int = 100,
+        tail_probe_attempts: int = 5,
+        tail_probe_timeout_seconds: float = 0.01,
     ) -> AsyncIterator[tuple[int, Any]]:
         """Replay and follow a durable DBOS stream from a consumer cursor.
 
         ``offset`` is the number of values already consumed. In ``raw`` mode,
         those values are skipped and reading starts directly at ``offset``. In
         ``compact`` mode, values before ``offset`` are replayed as compacted
-        logical delta blocks before normal one-event streaming resumes at the
-        supplied offset. Polling and timeout options are passed through to DBOS;
-        the timeout applies to each awaited stream value.
+        logical delta blocks before normal one-event streaming resumes there.
+        ``compact_tail`` sparsely probes beyond ``offset`` to find a bounded
+        near-tail cursor, compacts through the last confirmed persisted value,
+        then resumes normal streaming from that discovered cursor.
         """
         if offset < 0:
             raise ValueError("offset must be non-negative")
-        if replay not in ("raw", "compact"):
-            raise ValueError("replay must be 'raw' or 'compact'")
+        if replay not in ("raw", "compact", "compact_tail"):
+            raise ValueError("replay must be 'raw', 'compact', or 'compact_tail'")
+        if replay == "compact_tail":
+            if tail_probe_stride <= 0:
+                raise ValueError("tail_probe_stride must be positive")
+            if tail_probe_attempts <= 0:
+                raise ValueError("tail_probe_attempts must be positive")
+            if tail_probe_timeout_seconds <= 0:
+                raise ValueError("tail_probe_timeout_seconds must be positive")
 
-        if replay == "compact" and offset > 0:
+        replay_boundary = offset
+        if replay == "compact_tail":
+            replay_boundary = await _discover_compact_tail(
+                workflow_id,
+                stream_key,
+                offset=offset,
+                stride=tail_probe_stride,
+                attempts=tail_probe_attempts,
+                timeout_seconds=tail_probe_timeout_seconds,
+            )
+
+        if replay in ("compact", "compact_tail") and replay_boundary > 0:
             historical: list[tuple[int, Any]] = []
             historical_stream = DBOS.read_stream_async(
                 workflow_id,
@@ -526,7 +574,7 @@ class DBOSRunner:
                 async for event in historical_stream:
                     cursor += 1
                     historical.append((cursor, event))
-                    if cursor >= offset:
+                    if cursor >= replay_boundary:
                         break
             finally:
                 await historical_stream.aclose()
@@ -534,11 +582,11 @@ class DBOSRunner:
             for item in _compact_replay_events(historical):
                 yield item
 
-        next_offset = offset
+        next_offset = replay_boundary
         async for event in DBOS.read_stream_async(
             workflow_id,
             stream_key,
-            offset=offset,
+            offset=replay_boundary,
             polling_interval_sec=polling_interval_sec,
             timeout_seconds=timeout_seconds,
         ):

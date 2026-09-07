@@ -215,6 +215,34 @@ async for cursor, event in DBOSRunner.attach_stream(
     render(event)
 ```
 
+`replay="compact_tail"` treats the supplied offset as a known lower bound rather
+than the final replay boundary. It probes sparse offsets ahead of that cursor with
+very short single-offset reads. Each successful probe proves that the stream has
+persisted at least that far; the first timeout stops discovery. Historical events
+are then compacted through the last confirmed probe and ordinary raw streaming
+resumes immediately after that boundary. Any events written while compaction is in
+progress are picked up by the raw catch-up reader, so the mode does not require a
+frozen stream or an exact tail search.
+
+```python
+async for cursor, event in DBOSRunner.attach_stream(
+    handle.get_workflow_id(),
+    AGENT_STREAM_KEY,
+    offset=last_offset,
+    replay="compact_tail",
+    tail_probe_stride=100,
+    tail_probe_attempts=5,
+    tail_probe_timeout_seconds=0.01,
+):
+    render(event)
+```
+
+For example, with `offset=500` and `tail_probe_stride=100`, successful probes at
+raw offsets 600, 700, and 800 followed by a timeout at 900 compact through raw
+offset 800 (cursor 801), then resume normal streaming from cursor 801. The probe
+search is deliberately bounded and may stop short of the true tail; the subsequent
+raw reader catches up the remainder without losing events.
+
 Compaction preserves event order and logical boundaries. Reasoning deltas, output
 text deltas, and streamed tool-call arguments are compacted only while consecutive
 and associated with the same SDK event identity. Lifecycle and non-delta events
@@ -224,7 +252,8 @@ remain separate.
 
 `attach_stream()` passes `polling_interval_sec` and `timeout_seconds` directly to
 DBOS stream reads. A timeout is an inter-event timeout: DBOS restarts the timeout
-after each value is received.
+after each value is received. `tail_probe_timeout_seconds` is separate and applies
+only to the bounded sparse probes used by `replay="compact_tail"`.
 
 ```python
 async for cursor, event in DBOSRunner.attach_stream(
